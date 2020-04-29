@@ -691,9 +691,13 @@ public:
   void PushDestructorCleanup(const CXXDestructorDecl *Dtor, QualType T,
                              Address Addr);
 
+  /// EmitImplicitSyncCleanup - Emit an implicit sync.
+  void EmitImplicitSyncCleanup(llvm::Instruction *SyncRegion = nullptr);
+
   /// PopCleanupBlock - Will pop the cleanup entry on the stack and
   /// process all branch fixups.
-  void PopCleanupBlock(bool FallThroughIsBranchThrough = false);
+  void PopCleanupBlock(bool FallThroughIsBranchThrough = false,
+                       bool AfterSync = false);
 
   /// DeactivateCleanupBlock - Deactivates the given cleanup block.
   /// The block cannot be reactivated.  Pops it if it's the top of the
@@ -724,6 +728,10 @@ public:
     bool OldDidCallStackSave;
   protected:
     bool PerformCleanup;
+    bool CleanupAfterSync;
+    /// Protected method to control whether a sync is inserted before any
+    /// cleanups.
+    void setCleanupAfterSync(bool V = true) { CleanupAfterSync = V; }
   private:
 
     RunCleanupsScope(const RunCleanupsScope &) = delete;
@@ -735,7 +743,7 @@ public:
   public:
     /// Enter a new cleanup scope.
     explicit RunCleanupsScope(CodeGenFunction &CGF)
-      : PerformCleanup(true), CGF(CGF)
+      : PerformCleanup(true), CleanupAfterSync(false), CGF(CGF)
     {
       CleanupStackDepth = CGF.EHStack.stable_begin();
       LifetimeExtendedCleanupStackSize =
@@ -767,7 +775,7 @@ public:
       assert(PerformCleanup && "Already forced cleanup");
       CGF.DidCallStackSave = OldDidCallStackSave;
       CGF.PopCleanupBlocks(CleanupStackDepth, LifetimeExtendedCleanupStackSize,
-                           ValuesToReload);
+                           ValuesToReload, CleanupAfterSync);
       PerformCleanup = false;
       CGF.CurrentCleanupScopeDepth = OldCleanupScopeDepth;
     }
@@ -1030,11 +1038,52 @@ public:
     void RestoreOldScope();
   };
 
+  /// Cleanup to ensure a sync is inserted.  If no SyncRegion is specified, then
+  /// this cleanup actually serves as a placeholder in EHStack, which ensures
+  /// that an implicit sync is inserted before any normal cleanups.
+  struct ImplicitSyncCleanup final : public EHScopeStack::Cleanup {
+    llvm::Instruction *SyncRegion;
+  public:
+    ImplicitSyncCleanup(llvm::Instruction *SyncRegion = nullptr)
+        : SyncRegion(SyncRegion) {}
+
+    void Emit(CodeGenFunction &CGF, Flags F) {
+      if (SyncRegion)
+        CGF.EmitImplicitSyncCleanup(SyncRegion);
+    }
+  };
+
+  // Subclass of RunCleanupsScope that ensures an implicit sync is emitted
+  // before cleanups.
+  class ImplicitSyncScope : public RunCleanupsScope {
+    ImplicitSyncScope(const ImplicitSyncScope &) = delete;
+    void operator=(const ImplicitSyncScope &) = delete;
+  public:
+    explicit ImplicitSyncScope(CodeGenFunction &CGF) : RunCleanupsScope(CGF) {
+      setCleanupAfterSync();
+      CGF.EHStack.pushCleanup<ImplicitSyncCleanup>(NormalCleanup);
+    }
+
+    ~ImplicitSyncScope() {
+      if (PerformCleanup)
+        ForceCleanup();
+    }
+
+    void ForceCleanup() {
+      RunCleanupsScope::ForceCleanup();
+    }
+  };
+
+  /// A sync region is a collection of spawned tasks and syncs such that syncs
+  /// in the collection may wait on the spawned tasks in the same collection
+  /// (control-flow permitting).  In Cilk, certain constructs, such as functions
+  /// _Cilk_spawn bodies, or _Cilk_for loop bodies, use a separate sync region
+  /// to handle spawning and syncing of tasks within that construct.
   class SyncRegion {
     CodeGenFunction &CGF;
     SyncRegion *ParentRegion;
     llvm::Instruction *SyncRegionStart = nullptr;
-    RunCleanupsScope *InnerSyncScope = nullptr;
+    ImplicitSyncScope *InnerSyncScope = nullptr;
 
     SyncRegion(const SyncRegion &) = delete;
     void operator=(const SyncRegion &) = delete;
@@ -1051,36 +1100,13 @@ public:
     llvm::Instruction *getSyncRegionStart() const {
       return SyncRegionStart;
     }
-
     void setSyncRegionStart(llvm::Instruction *SRStart) {
       SyncRegionStart = SRStart;
     }
 
     void addImplicitSync() {
-      if (!InnerSyncScope) {
-        InnerSyncScope = new RunCleanupsScope(CGF);
-        CGF.EHStack.pushCleanup<ImplicitSyncCleanup>(NormalCleanup);
-      }
-    }
-  };
-
-  /// Cleanup to ensure parent stack frame is synced.
-  struct ImplicitSyncCleanup final : public EHScopeStack::Cleanup {
-    llvm::Instruction *SyncRegion;
-  public:
-    ImplicitSyncCleanup(llvm::Instruction *SyncRegion = nullptr)
-        : SyncRegion(SyncRegion) {}
-    void Emit(CodeGenFunction &CGF, Flags F) {
-      llvm::Instruction *SR = SyncRegion;
-      // If a sync region wasn't specified with this cleanup initially, try to
-      // graph the current sync region.
-      if (!SR && CGF.CurSyncRegion)
-        SR = CGF.CurSyncRegion->getSyncRegionStart();
-      if (SR) {
-        llvm::BasicBlock *ContinueBlock = CGF.createBasicBlock("sync.continue");
-        CGF.Builder.CreateSync(ContinueBlock, SR);
-        CGF.EmitBlock(ContinueBlock);
-      }
+      if (!InnerSyncScope)
+        InnerSyncScope = new ImplicitSyncScope(CGF);
     }
   };
 
@@ -1106,8 +1132,47 @@ public:
       CurSyncRegion->setSyncRegionStart(EmitSyncRegionStart());
   }
 
-  /// Testing lifetime-like cleanup for invoking taskframe.end.
-  /// Cleanup to ensure task frame is ended.
+  // Flag to indicate whether the current scope is synced.  Currently this flag
+  // is used to optionally push a SyncRegion inside of a lexical scope, so that
+  // any cleanups run within that lexical scope occur after an implicit sync.
+  bool ScopeIsSynced = false;
+
+  // RAII for maintaining CodeGenFunction::ScopeIsSynced.
+  class SyncedScopeRAII {
+    CodeGenFunction &CGF;
+    bool OldScopeIsSynced;
+  public:
+    SyncedScopeRAII(CodeGenFunction &CGF)
+        : CGF(CGF), OldScopeIsSynced(CGF.ScopeIsSynced) {}
+    ~SyncedScopeRAII() { CGF.ScopeIsSynced = OldScopeIsSynced; }
+  };
+
+  // RAII for pushing and popping a sync region.
+  class SyncRegionRAII {
+    CodeGenFunction &CGF;
+    bool OldScopeIsSynced;
+  public:
+    SyncRegionRAII(CodeGenFunction &CGF, bool addImplicitSync = true)
+        : CGF(CGF), OldScopeIsSynced(CGF.ScopeIsSynced) {
+      if (CGF.ScopeIsSynced) {
+        CGF.PushSyncRegion();
+        // If requested, add an implicit sync onto this sync region.
+        if (addImplicitSync)
+          CGF.CurSyncRegion->addImplicitSync();
+
+        CGF.ScopeIsSynced = false;
+      }
+    }
+    ~SyncRegionRAII() {
+      if (OldScopeIsSynced) {
+        CGF.PopSyncRegion();
+        CGF.ScopeIsSynced = OldScopeIsSynced;
+      }
+    }
+  };
+
+  /// Cleanup to ensure a taskframe is ended with a taskframe.resume on an
+  /// exception-handling path.
   struct CallTaskEnd final : public EHScopeStack::Cleanup {
     llvm::Value *TaskFrame;
   public:
@@ -1135,7 +1200,8 @@ public:
     }
   };
 
-  /// Cleanup to ensure detached task is ended.
+  /// Cleanup to ensure spawned task is ended with a detached.rethrow on an
+  /// exception-handling path.
   struct CallDetRethrow final : public EHScopeStack::Cleanup {
     llvm::Value *SyncRegion;
     llvm::BasicBlock *TempInvokeDest;
@@ -1168,7 +1234,13 @@ public:
     }
   };
 
-  /// RAII object to manage creation of detach/reattach instructions.
+  /// Object to manage creation of spawned tasks using Tapir instructions.
+  ///
+  /// Conceptually, each spawned task corresponds to a detach scope, which gets
+  /// its own copy of specific CodeGenFunction state, such as its own alloca
+  /// insert point and exception-handling state.  In practice, detach scopes
+  /// maintain two scopes for each spawned task: a scope corresponding with the
+  /// taskframe of the task, and a scope for the task itself.
   class DetachScope {
     CodeGenFunction &CGF;
     bool DetachStarted = false;
@@ -1177,22 +1249,35 @@ public:
     llvm::BasicBlock *DetachedBlock = nullptr;
     llvm::BasicBlock *ContinueBlock = nullptr;
 
+    // Pointer to the parent detach scope.
     DetachScope *ParentScope;
 
-    std::unique_ptr<RunCleanupsScope> TaskFrameCleanups = nullptr;
-    std::unique_ptr<RunCleanupsScope> DetRethrowScope = nullptr;
+    // Possible cleanup scope from a child ExprWithCleanups of a CilkSpawnStmt.
+    // We keep track of this scope in order to properly adjust the scope when
+    // the emission of the task itself injects an additional cleanup onto
+    // EHStack.
     RunCleanupsScope *StmtCleanupsScope = nullptr;
 
-    // Old state from the CGF to restore when we're done with the detach.
+    // Old alloca insertion points from the CGF to restore when we're done
+    // emitting the spawned task and associated taskframe.
     llvm::AssertingVH<llvm::Instruction> OldAllocaInsertPt = nullptr;
+    // Alloca insertion point for the taskframe, which we save and restore
+    // around the emission of the spawned task itself.
     llvm::AssertingVH<llvm::Instruction> TFAllocaInsertPt = nullptr;
+    // A temporary invoke destination, maintained to handle the emission of
+    // detached.rethrow and taskframe.resume intrinsics on exception-handling
+    // paths out of a spawned task or its taskframe.
     llvm::BasicBlock *TempInvokeDest = nullptr;
 
+    // Old EH state from the CGF to restore when we're done emitting the spawned
+    // task and associated taskframe.
     llvm::BasicBlock *OldEHResumeBlock = nullptr;
     llvm::Value *OldExceptionSlot = nullptr;
     llvm::AllocaInst *OldEHSelectorSlot = nullptr;
     Address OldNormalCleanupDest = Address::invalid();
 
+    // EH state for the taskframe, which we save and restore around the emission
+    // of the spawned task itself.
     llvm::BasicBlock *TFEHResumeBlock = nullptr;
     llvm::Value *TFExceptionSlot = nullptr;
     llvm::AllocaInst *TFEHSelectorSlot = nullptr;
@@ -1230,6 +1315,8 @@ public:
       CGF.CurDetachScope = ParentScope;
     }
 
+    // Optionally save the specified cleanups scope, so it can be properly
+    // updated when a spawned task is emitted.
     bool MaybeSaveCleanupsScope(RunCleanupsScope *Scope) {
       if (!StmtCleanupsScope) {
         StmtCleanupsScope = Scope;
@@ -1238,30 +1325,45 @@ public:
       return false;
     }
 
+    // Methods to handle the taskframe associated with the spawned task.
     void EnsureTaskFrame();
     llvm::Value *GetTaskFrame() { return TaskFrame; }
 
+    // Create nested exception-handling state for a taskframe or spawned task.
     void CreateTaskFrameEHState();
     void CreateDetachedEHState();
-    void RestoreTaskFrameEHState();
-    void RestoreParentEHState();
+    // Restore ancestor exception-handling state of a spawned task or taskframe.
+    // Returns a pointer to any EHResumeBlock that was generated during the
+    // emission of the spawned task or taskframe.
+    llvm::BasicBlock *RestoreTaskFrameEHState();
+    llvm::BasicBlock *RestoreParentEHState();
 
+    // Get a temporary destination for an invoke, creating a new one if
+    // necessary.
     llvm::BasicBlock *getTempInvokeDest() {
       if (!TempInvokeDest)
         TempInvokeDest = CGF.createBasicBlock("temp.invoke.dest");
       return TempInvokeDest;
     }
 
+    // Start the spawned task, i.e., by emitting a detach instruction and
+    // setting up nested CGF state.
     void StartDetach();
+    // Returns true if the spawned task has started.
+    bool IsDetachStarted() const { return DetachStarted; }
+    // Push a terminator for the spawned task onto EHStack.
     void PushSpawnedTaskTerminate();
+    // Clean up state for the spawned task.
     void CleanupDetach();
+    // Emit the end of the spawned task, i.e., a reattach.
     void EmitTaskEnd();
+    // Finish the spawned task.
     void FinishDetach();
 
+    // Create a temporary for the spawned task, specifically, before the spawned
+    // task has started.
     Address CreateDetachedMemTemp(QualType Ty, StorageDuration SD,
                                   const Twine &Name = "det.tmp");
-
-    bool IsDetachStarted() const { return DetachStarted; }
   };
 
   /// The current detach scope.
@@ -1284,7 +1386,8 @@ public:
   /// that have been added.
   void
   PopCleanupBlocks(EHScopeStack::stable_iterator OldCleanupStackSize,
-                   std::initializer_list<llvm::Value **> ValuesToReload = {});
+                   std::initializer_list<llvm::Value **> ValuesToReload = {},
+                   bool AfterSync = false);
 
   /// Takes the old cleanup stack size and emits the cleanup blocks
   /// that have been added, then adds all lifetime-extended cleanups from
@@ -1292,12 +1395,8 @@ public:
   void
   PopCleanupBlocks(EHScopeStack::stable_iterator OldCleanupStackSize,
                    size_t OldLifetimeExtendedStackSize,
-                   std::initializer_list<llvm::Value **> ValuesToReload = {});
-
-  void PopCleanupBlocksAndDetach(
-      EHScopeStack::stable_iterator OldCleanupStackSize,
-      size_t OldLifetimeExtendedStackSize,
-      std::initializer_list<llvm::Value **> ValuesToReload = {});
+                   std::initializer_list<llvm::Value **> ValuesToReload = {},
+                   bool AfterSync = false);
 
   void ResolveBranchFixups(llvm::BasicBlock *Target);
 

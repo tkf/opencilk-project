@@ -176,6 +176,10 @@ void LoopOutlineProcessor::addSyncToOutlineReturns(TapirLoopInfo &TL,
     cast<Value>(VMap[TL.getTask()->getDetach()->getSyncRegion()]);
   EscapeEnumerator EE(*Out.Outline, "ls.sync", false);
   while (IRBuilder<> *AtExit = EE.Next()) {
+    // TODO: Add an option to insert syncs before resumes.
+    if (!isa<ReturnInst>(*AtExit->GetInsertPoint()))
+      continue;
+
     BasicBlock *Exit = AtExit->GetInsertBlock();
     BasicBlock *NewExit = SplitBlock(Exit, Exit->getTerminator());
     SyncInst *NewSync = SyncInst::Create(NewExit, SyncRegion);
@@ -333,7 +337,8 @@ private:
       TapirLoopInfo *TL, std::vector<BasicBlock *> &TaskBlocks,
       SmallPtrSetImpl<BasicBlock *> &ReattachBlocks,
       SmallPtrSetImpl<BasicBlock *> &DetachedRethrowBlocks,
-      SmallPtrSetImpl<BasicBlock *> &SharedEHEntries);
+      SmallPtrSetImpl<BasicBlock *> &SharedEHEntries,
+      SmallPtrSetImpl<BasicBlock *> &UnreachableExits);
 
   // Outline Tapir loop \p TL into a helper function.  The \p Args set specified
   // the arguments to that helper function.  The map \p VMap will store the
@@ -735,6 +740,19 @@ void LoopSpawningImpl::associateTasksToTapirLoops() {
   }
 }
 
+// Helper test to see if the given basic block is the placeholder normal
+// destination of a detached.rethrow or taskframe.resume intrinsic.
+static bool isUnreachablePlaceholder(const BasicBlock *B) {
+  for (const BasicBlock *Pred : predecessors(B)) {
+    if (!isDetachedRethrow(Pred->getTerminator()) &&
+        !isTaskFrameResume(Pred->getTerminator()))
+      return false;
+    if (B != cast<InvokeInst>(Pred->getTerminator())->getNormalDest())
+      return false;
+  }
+  return true;
+}
+
 /// Get the set of basic blocks within the task of Tapir loop \p TL.  The \p
 /// TaskBlocks vector stores all of these basic blocks.  The \p ReattachBlocks
 /// set identifies which blocks are terminated by a reattach instruction that
@@ -749,7 +767,8 @@ void LoopSpawningImpl::getTapirLoopTaskBlocks(
     TapirLoopInfo *TL, std::vector<BasicBlock *> &TaskBlocks,
     SmallPtrSetImpl<BasicBlock *> &ReattachBlocks,
     SmallPtrSetImpl<BasicBlock *> &DetachedRethrowBlocks,
-    SmallPtrSetImpl<BasicBlock *> &SharedEHEntries) {
+    SmallPtrSetImpl<BasicBlock *> &SharedEHEntries,
+    SmallPtrSetImpl<BasicBlock *> &UnreachableExits) {
   NamedRegionTimer NRT("getTapirLoopTaskBlocks",
                        "Get basic blocks for Tapir loop",
                        TimerGroupName, TimerGroupDescription,
@@ -798,6 +817,11 @@ void LoopSpawningImpl::getTapirLoopTaskBlocks(
         if (TopLevelTaskSpindle && isSuccessorOfDetachedRethrow(B))
           continue;
 
+        // Skip unreachable placeholder blocks, namely, the normal destinations
+        // of detached.rethrow and taskframe.resume instructions.
+        if (isUnreachablePlaceholder(B))
+          continue;
+
         LLVM_DEBUG(dbgs() << "Adding block " << B->getName() << "\n");
         TaskBlocks.push_back(B);
 
@@ -807,6 +831,10 @@ void LoopSpawningImpl::getTapirLoopTaskBlocks(
             ReattachBlocks.insert(B);
           if (isDetachedRethrow(B->getTerminator()))
             DetachedRethrowBlocks.insert(B);
+        } else if (isDetachedRethrow(B->getTerminator()) ||
+                   isTaskFrameResume(B->getTerminator())) {
+          UnreachableExits.insert(
+              cast<InvokeInst>(B->getTerminator())->getNormalDest());
         }
       }
     }
@@ -1001,11 +1029,12 @@ Function *LoopSpawningImpl::createHelperForTapirLoop(
   // rewritten in the cloned helper.
   SmallPtrSet<BasicBlock *, 4> SharedEHEntries;
   SmallPtrSet<BasicBlock *, 4> DetachedRethrowBlocks;
+  SmallPtrSet<BasicBlock *, 4> UnreachableExits;
   // Reattach instructions and detached rethrows in this task might need special
   // handling.
   SmallPtrSet<BasicBlock *, 4> ReattachBlocks;
   getTapirLoopTaskBlocks(TL, TLBlocks, ReattachBlocks, DetachedRethrowBlocks,
-                         SharedEHEntries);
+                         SharedEHEntries, UnreachableExits);
   TLBlocks.push_back(L->getLoopLatch());
 
   DetachInst *DI = T->getDetach();
@@ -1031,8 +1060,8 @@ Function *LoopSpawningImpl::createHelperForTapirLoop(
                  Preheader, TL->getExitBlock(), VMap, DestM,
                  F.getSubprogram() != nullptr, Returns,
                  NameSuffix.str(), nullptr, &DetachedRethrowBlocks,
-                 &SharedEHEntries, TL->getUnwindDest(), InputSyncRegion,
-                 nullptr, nullptr, nullptr, nullptr);
+                 &SharedEHEntries, TL->getUnwindDest(), &UnreachableExits,
+                 InputSyncRegion, nullptr, nullptr, nullptr, nullptr);
   } // end timed region
 
   assert(Returns.empty() && "Returns cloned when cloning detached CFG.");

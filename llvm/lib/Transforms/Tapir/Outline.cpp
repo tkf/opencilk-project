@@ -168,9 +168,10 @@ void llvm::CloneIntoFunction(
                        TimePassesIsEnabled);
   for (const BasicBlock *BB : Blocks) {
     BasicBlock *CBB = cast<BasicBlock>(VMap[BB]);
+    LLVM_DEBUG(dbgs() << "In block " << CBB->getName() << "\n");
     // Loop over all instructions, fixing each one as we find it...
     for (Instruction &II : *CBB) {
-      LLVM_DEBUG(dbgs() << "Remapping " << II << "\n");
+      LLVM_DEBUG(dbgs() << "  Remapping " << II << "\n");
       RemapInstruction(&II, VMap,
                        ModuleLevelChanges ? RF_None : RF_NoModuleLevelChanges,
                        TypeMapper, Materializer);
@@ -192,7 +193,9 @@ Function *llvm::CreateHelper(
     SmallPtrSetImpl<BasicBlock *> *ReattachBlocks,
     SmallPtrSetImpl<BasicBlock *> *DetachRethrowBlocks,
     SmallPtrSetImpl<BasicBlock *> *SharedEHEntries,
-    const BasicBlock *OldUnwind, const Instruction *InputSyncRegion,
+    const BasicBlock *OldUnwind,
+    SmallPtrSetImpl<BasicBlock *> *UnreachableExits,
+    const Instruction *InputSyncRegion,
     Type *ReturnType, ClonedCodeInfo *CodeInfo,
     ValueMapTypeRemapper *TypeMapper, ValueMaterializer *Materializer) {
   LLVM_DEBUG(dbgs() << "inputs: " << Inputs.size() << "\n");
@@ -342,7 +345,7 @@ Function *llvm::CreateHelper(
       Header->getContext(), OldEntry->getName()+NameSuffix, NewFunc);
   // The new function also needs an exit node.
   BasicBlock *NewExit = BasicBlock::Create(
-      Header->getContext(), OldExit->getName()+NameSuffix, NewFunc);
+      Header->getContext(), OldExit->getName()+NameSuffix);
 
   // Add mappings to the NewEntry and NewExit.
   VMap[OldEntry] = NewEntry;
@@ -352,7 +355,7 @@ Function *llvm::CreateHelper(
   // Create a new unwind destination for the cloned blocks if it's needed.
   if (OldUnwind) {
     NewUnwind = BasicBlock::Create(
-        NewFunc->getContext(), OldUnwind->getName()+NameSuffix, NewFunc);
+        NewFunc->getContext(), OldUnwind->getName()+NameSuffix);
     VMap[OldUnwind] = NewUnwind;
   }
 
@@ -366,6 +369,16 @@ Function *llvm::CreateHelper(
     VMap[InputSyncRegion] = NewSR;
   }
 
+  // Create an new unreachable exit block, if needed.
+  BasicBlock *NewUnreachable = nullptr;
+  if (UnreachableExits && !UnreachableExits->empty()) {
+    NewUnreachable = BasicBlock::Create(
+        NewFunc->getContext(), "unreachable"+NameSuffix);
+    new UnreachableInst(NewFunc->getContext(), NewUnreachable);
+    for (BasicBlock *Unreachable : *UnreachableExits)
+      VMap[Unreachable] = NewUnreachable;
+  }
+
   // Clone Blocks into the new function.
   CloneIntoFunction(NewFunc, OldFunc, Blocks, VMap, ModuleLevelChanges,
                     Returns, NameSuffix, ReattachBlocks, DetachRethrowBlocks,
@@ -373,6 +386,7 @@ Function *llvm::CreateHelper(
 
   // Add a branch in the new function to the cloned Header.
   BranchInst::Create(cast<BasicBlock>(VMap[Header]), NewEntry);
+  NewExit->insertInto(NewFunc);
   // Add a return in the new function, with a default null value if necessary.
   if (VoidRet)
     ReturnInst::Create(Header->getContext(), NewExit);
@@ -383,12 +397,17 @@ Function *llvm::CreateHelper(
   // If needed, create a landingpad and resume for the unwind destination in the
   // new function.
   if (OldUnwind) {
+    NewUnwind->insertInto(NewFunc);
     LandingPadInst *LPad =
       LandingPadInst::Create(OldUnwind->getLandingPadInst()->getType(), 0,
                              "lpadval", NewUnwind);
     LPad->setCleanup(true);
     ResumeInst::Create(LPad, NewUnwind);
   }
+
+  // If needed, add the new unreachable destination.
+  if (NewUnreachable)
+    NewUnreachable->insertInto(NewFunc);
 
   return NewFunc;
 }

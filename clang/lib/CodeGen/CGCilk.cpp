@@ -19,14 +19,6 @@
 using namespace clang;
 using namespace CodeGen;
 
-// Stolen from CodeGenFunction.cpp
-static void EmitIfUsed(CodeGenFunction &CGF, llvm::BasicBlock *BB) {
-  if (!BB) return;
-  if (!BB->use_empty())
-    return CGF.CurFn->getBasicBlockList().push_back(BB);
-  delete BB;
-}
-
 CodeGenFunction::IsSpawnedScope::IsSpawnedScope(CodeGenFunction *CGF)
     : CGF(CGF), OldIsSpawned(CGF->IsSpawned),
       OldSpawnedCleanup(CGF->SpawnedCleanup) {
@@ -45,6 +37,20 @@ bool CodeGenFunction::IsSpawnedScope::OldScopeIsSpawned() const {
 void CodeGenFunction::IsSpawnedScope::RestoreOldScope() {
   CGF->IsSpawned = OldIsSpawned;
   CGF->SpawnedCleanup = OldSpawnedCleanup;
+}
+
+void CodeGenFunction::EmitImplicitSyncCleanup(llvm::Instruction *SyncRegion) {
+  llvm::Instruction *SR = SyncRegion;
+  // If a sync region wasn't specified with this cleanup initially, try to grab
+  // the current sync region.
+  if (!SR && CurSyncRegion && CurSyncRegion->getSyncRegionStart())
+    SR = CurSyncRegion->getSyncRegionStart();
+  if (!SR)
+    return;
+
+  llvm::BasicBlock *ContinueBlock = createBasicBlock("sync.continue");
+  Builder.CreateSync(ContinueBlock, SR);
+  EmitBlockAfterUses(ContinueBlock);
 }
 
 void CodeGenFunction::DetachScope::CreateTaskFrameEHState() {
@@ -71,20 +77,22 @@ void CodeGenFunction::DetachScope::CreateDetachedEHState() {
   CGF.NormalCleanupDest = Address::invalid();
 }
 
-void CodeGenFunction::DetachScope::RestoreTaskFrameEHState() {
-  EmitIfUsed(CGF, CGF.EHResumeBlock);
+llvm::BasicBlock *CodeGenFunction::DetachScope::RestoreTaskFrameEHState() {
+  llvm::BasicBlock *NestedEHResumeBlock = CGF.EHResumeBlock;
   CGF.EHResumeBlock = TFEHResumeBlock;
   CGF.ExceptionSlot = TFExceptionSlot;
   CGF.EHSelectorSlot = TFEHSelectorSlot;
   CGF.NormalCleanupDest = TFNormalCleanupDest;
+  return NestedEHResumeBlock;
 }
 
-void CodeGenFunction::DetachScope::RestoreParentEHState() {
-  EmitIfUsed(CGF, CGF.EHResumeBlock);
+llvm::BasicBlock *CodeGenFunction::DetachScope::RestoreParentEHState() {
+  llvm::BasicBlock *NestedEHResumeBlock = CGF.EHResumeBlock;
   CGF.EHResumeBlock = OldEHResumeBlock;
   CGF.ExceptionSlot = OldExceptionSlot;
   CGF.EHSelectorSlot = OldEHSelectorSlot;
   CGF.NormalCleanupDest = OldNormalCleanupDest;
+  return NestedEHResumeBlock;
 }
 
 void CodeGenFunction::DetachScope::EnsureTaskFrame() {
@@ -223,8 +231,9 @@ static void EmitTrivialLandingPad(CodeGenFunction &CGF,
 }
 
 void CodeGenFunction::DetachScope::FinishDetach() {
-  assert(DetachStarted &&
-         "Attempted to finish a detach that was not started.");
+  if (!DetachStarted)
+    return;
+
   CleanupDetach();
   // Pop the detached_rethrow.
   CGF.PopCleanupBlock();
@@ -240,7 +249,8 @@ void CodeGenFunction::DetachScope::FinishDetach() {
   }
 
   // Restore the task frame's EH state.
-  RestoreTaskFrameEHState();
+  llvm::BasicBlock *TaskResumeBlock = RestoreTaskFrameEHState();
+  assert(!TaskResumeBlock && "Emission of task produced a resume block");
 
   llvm::BasicBlock *InvokeDest = nullptr;
   if (TempInvokeDest) {
@@ -253,6 +263,7 @@ void CodeGenFunction::DetachScope::FinishDetach() {
       TempInvokeDest = nullptr;
     }
   }
+
   // Emit the continue block.
   CGF.EmitBlock(ContinueBlock);
 
@@ -283,13 +294,28 @@ void CodeGenFunction::DetachScope::FinishDetach() {
   }
 
   // Restore the original EH state.
-  RestoreParentEHState();
+  llvm::BasicBlock *NestedEHResumeBlock = RestoreParentEHState();
 
   if (TempInvokeDest) {
     if (llvm::BasicBlock *InvokeDest = CGF.getInvokeDest()) {
       TempInvokeDest->replaceAllUsesWith(InvokeDest);
     } else
       EmitTrivialLandingPad(CGF, TempInvokeDest);
+  }
+
+  // If invocations in the parallel task led to the creation of EHResumeBlock,
+  // we need to create for outside the task.  In particular, the new
+  // EHResumeBlock must use an ExceptionSlot and EHSelectorSlot allocated
+  // outside of the task.
+  if (NestedEHResumeBlock) {
+    if (!NestedEHResumeBlock->use_empty()) {
+      // Translate the nested EHResumeBlock into an appropriate EHResumeBlock in
+      // the outer scope.
+      NestedEHResumeBlock->replaceAllUsesWith(
+          CGF.getEHResumeBlock(
+              isa<llvm::ResumeInst>(NestedEHResumeBlock->getTerminator())));
+    }
+    delete NestedEHResumeBlock;
   }
 }
 
@@ -347,6 +373,13 @@ static const Stmt *IgnoreImplicitAndCleanups(const Stmt *S) {
   return Current;
 }
 
+static void FailedSpawnWarning(CodeGenFunction &CGF, SourceLocation SLoc) {
+  DiagnosticsEngine &Diags = CGF.CGM.getDiags();
+  unsigned DiagID = Diags.getCustomDiagID(DiagnosticsEngine::Warning,
+                                          "Failed to produce spawn");
+  Diags.Report(SLoc, DiagID);
+}
+
 void CodeGenFunction::EmitCilkSpawnStmt(const CilkSpawnStmt &S) {
   // Handle spawning of calls in a special manner, to evaluate
   // arguments before spawn.
@@ -362,8 +395,8 @@ void CodeGenFunction::EmitCilkSpawnStmt(const CilkSpawnStmt &S) {
 
     // Finish the detach.
     if (IsSpawned) {
-      assert(CurDetachScope->IsDetachStarted() &&
-             "Processing _Cilk_spawn of expression did not produce a detach.");
+      if (!CurDetachScope->IsDetachStarted())
+        FailedSpawnWarning(*this, S.getBeginLoc());
       IsSpawned = false;
       PopDetachScope();
     }
@@ -376,6 +409,10 @@ void CodeGenFunction::EmitCilkSpawnStmt(const CilkSpawnStmt &S) {
   // Set up to perform a detach.
   PushDetachScope();
   CurDetachScope->StartDetach();
+
+  SyncedScopeRAII SyncedScp(*this);
+  if (isa<CompoundStmt>(S.getSpawnedStmt()))
+    ScopeIsSynced = true;
 
   // Emit the spawned statement.
   EmitStmt(S.getSpawnedStmt());
@@ -396,8 +433,8 @@ LValue CodeGenFunction::EmitCilkSpawnExprLValue(const CilkSpawnExpr *E) {
 
   // Finish the detach.
   if (IsSpawned) {
-    assert(CurDetachScope->IsDetachStarted() &&
-           "Processing _Cilk_spawn of expression did not produce a detach.");
+    if (!CurDetachScope->IsDetachStarted())
+      FailedSpawnWarning(*this, E->getExprLoc());
     IsSpawned = false;
     PopDetachScope();
   }
@@ -471,8 +508,7 @@ void CodeGenFunction::EmitCilkForStmt(const CilkForStmt &S,
   Continue = getJumpDestInCurrentScope("pfor.inc");
 
   // Ensure that the _Cilk_for loop iterations are synced on exit from the loop.
-  EHStack.pushCleanup<ImplicitSyncCleanup>(NormalCleanup,
-                                           SyncRegion);
+  EHStack.pushCleanup<ImplicitSyncCleanup>(NormalCleanup, SyncRegion);
 
   // Create a cleanup scope for the condition variable cleanups.
   LexicalScope ConditionScope(*this, S.getSourceRange());
@@ -515,7 +551,7 @@ void CodeGenFunction::EmitCilkForStmt(const CilkForStmt &S,
 
     EmitBranch(DetachBlock);
 
-    EmitBlock(DetachBlock);
+    EmitBlockAfterUses(DetachBlock);
 
     // Get the value of the loop variable initialization before we emit the
     // detach.
@@ -583,8 +619,14 @@ void CodeGenFunction::EmitCilkForStmt(const CilkForStmt &S,
     // Create a separate cleanup scope for the body, in case it is not
     // a compound statement.
     RunCleanupsScope BodyScope(*this);
+
+    SyncedScopeRAII SyncedScp(*this);
+    if (isa<CompoundStmt>(S.getBody()))
+      ScopeIsSynced = true;
     EmitStmt(S.getBody());
-    Builder.CreateBr(Preattach.getBlock());
+
+    if (HaveInsertPoint())
+      Builder.CreateBr(Preattach.getBlock());
   }
 
   // Finish detached body and emit the reattach.
@@ -634,17 +676,19 @@ void CodeGenFunction::EmitCilkForStmt(const CilkForStmt &S,
   // we need to create for outside the task.  In particular, the new
   // EHResumeBlock must use an ExceptionSlot and EHSelectorSlot allocated
   // outside of the task.
-  if (NestedEHResumeBlock && !NestedEHResumeBlock->use_empty()) {
-    // Translate the nested EHResumeBlock into an appropriate EHResumeBlock in
-    // the outer scope.
-    NestedEHResumeBlock->replaceAllUsesWith(
-        getEHResumeBlock(
-            isa<llvm::ResumeInst>(NestedEHResumeBlock->getTerminator())));
+  if (NestedEHResumeBlock) {
+    if (!NestedEHResumeBlock->use_empty()) {
+      // Translate the nested EHResumeBlock into an appropriate EHResumeBlock in
+      // the outer scope.
+      NestedEHResumeBlock->replaceAllUsesWith(
+          getEHResumeBlock(
+              isa<llvm::ResumeInst>(NestedEHResumeBlock->getTerminator())));
+    }
     delete NestedEHResumeBlock;
   }
 
   // Emit the increment next.
-  EmitBlock(Continue.getBlock());
+  EmitBlockAfterUses(Continue.getBlock());
   EmitStmt(Inc);
 
   {

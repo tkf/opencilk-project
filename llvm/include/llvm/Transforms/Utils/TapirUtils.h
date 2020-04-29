@@ -38,12 +38,16 @@ bool isTaskFrameResume(const Instruction *I, const Value *TaskFrame = nullptr);
 bool ReattachMatchesDetach(const ReattachInst *RI, const DetachInst *DI,
                            DominatorTree *DT = nullptr);
 
-// Move static allocas in Block into Entry, which is assumed to dominate
-// Block.  Leave lifetime markers behind in Block and before each instruction in
-// ExitPoints for those static allocas.  Returns true if Block still contains
-// dynamic allocas, which cannot be moved.
+/// Move static allocas in Block into Entry, which is assumed to dominate Block.
+/// Leave lifetime markers behind in Block and before each instruction in
+/// ExitPoints for those static allocas.  Returns true if Block still contains
+/// dynamic allocas, which cannot be moved.
 bool MoveStaticAllocasInBlock(BasicBlock *Entry, BasicBlock *Block,
                               SmallVectorImpl<Instruction *> &ExitPoints);
+
+/// Inline any taskframe.resume markers associated with the given taskframe.  If
+/// \p DT is provided, then it will be updated to reflect the CFG changes.
+void InlineTaskFrameResumes(Value *TaskFrame, DominatorTree *DT = nullptr);
 
 /// Serialize the detach DI.  \p ParentEntry should be the entry block of the
 /// task that contains DI.  \p Reattaches, \p InlinedLPads, and \p
@@ -114,7 +118,8 @@ Value *getTaskFrameUsed(BasicBlock *Detached);
 /// splitTaskFrameCreateBlocks - Split basic blocks in function F at
 /// taskframe.create intrinsics.  Returns true if anything changed, false
 /// otherwise.
-bool splitTaskFrameCreateBlocks(Function &F);
+bool splitTaskFrameCreateBlocks(Function &F, DominatorTree *DT = nullptr,
+                                TaskInfo *TI = nullptr);
 
 /// fixupTaskFrameExternalUses - Fix any uses of variables defined in
 /// taskframes, but outside of tasks themselves.  For each such variable, insert

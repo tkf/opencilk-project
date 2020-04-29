@@ -323,6 +323,7 @@ void CodeGenFunction::FinishFunction(SourceLocation EndLoc) {
       DI->EmitLocation(Builder, EndLoc);
   }
 
+  bool Cilk = getLangOpts().getCilk() != LangOptions::Cilk_none;
   // Pop any cleanups that might have been associated with the
   // parameters.  Do this in whatever block we're currently in; it's
   // important to do this before we enter the return block or return
@@ -331,6 +332,7 @@ void CodeGenFunction::FinishFunction(SourceLocation EndLoc) {
   bool HasOnlyLifetimeMarkers =
       HasCleanups && EHStack.containsOnlyLifetimeMarkers(PrologueCleanupDepth);
   bool EmitRetDbgLoc = !HasCleanups || HasOnlyLifetimeMarkers;
+  bool SyncEmitted = false;
   if (HasCleanups) {
     // Make sure the line table doesn't jump back into the body for
     // the ret after it's been at EndLoc.
@@ -338,11 +340,22 @@ void CodeGenFunction::FinishFunction(SourceLocation EndLoc) {
       if (OnlySimpleReturnStmts)
         DI->EmitLocation(Builder, EndLoc);
 
-    PopCleanupBlocks(PrologueCleanupDepth);
+    PopCleanupBlocks(PrologueCleanupDepth, {}, Cilk);
+    SyncEmitted = true;
+  } else if (Cilk && Builder.GetInsertBlock()) {
+    // If we're compiling Cilk, emit an implicit sync for the function.
+    EmitImplicitSyncCleanup();
+    SyncEmitted = true;
   }
 
   // Emit function epilog (to return).
   llvm::DebugLoc Loc = EmitReturnBlock();
+
+  if (Cilk && !SyncEmitted) {
+    // If we're compiling Cilk, emit an implicit sync for the function.
+    EmitImplicitSyncCleanup();
+    SyncEmitted = true;
+  }
 
   if (ShouldInstrumentFunction()) {
     if (CGM.getCodeGenOpts().InstrumentFunctions)

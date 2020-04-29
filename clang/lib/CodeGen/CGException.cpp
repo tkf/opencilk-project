@@ -557,14 +557,17 @@ void CodeGenFunction::EmitCXXTryStmt(const CXXTryStmt &S) {
   {
     // If compiling Cilk code, create a nested sync region, with an implicit
     // sync, for the try-catch.
-    const LangOptions &LO = CGM.getLangOpts();
-    if (LO.getCilk() != LangOptions::Cilk_none)
+    bool Cilk = CGM.getLangOpts().getCilk() != LangOptions::Cilk_none;
+    SyncedScopeRAII SyncedScp(*this);
+    if (Cilk) {
       PushSyncRegion()->addImplicitSync();
-
+      if (isa<CompoundStmt>(S.getTryBlock()))
+        ScopeIsSynced = true;
+    }
     EmitStmt(S.getTryBlock());
 
     // Pop the nested sync region after the try block.
-    if (LO.getCilk() != LangOptions::Cilk_none)
+    if (Cilk)
       PopSyncRegion();
   }
   ExitCXXTryStmt(S);
