@@ -93,6 +93,15 @@ public:
   Value *getTaskFrameCreate() const;
   Task *getTaskFrameUser() const { return TaskFrameUser; }
   Spindle *getTaskFrameParent() const { return TaskFrameParent; }
+  BasicBlock *getTaskFrameContinuation() const;
+  /// Return the nesting level of this taskframe.
+  unsigned getTaskFrameDepth() const {
+    unsigned D = 0;
+    for (const Spindle *CurTF = TaskFrameParent; CurTF;
+         CurTF = CurTF->TaskFrameParent)
+      ++D;
+    return D;
+  }
 
   Task *getTaskFromTaskFrame() const;
 
@@ -624,6 +633,11 @@ public:
 
   /// Return true if this task is a "root" task, meaning that it has no parent task.
   bool isRootTask() const { return nullptr == ParentTask; }
+
+  /// Return true if the analysis found child taskframes of this task.  This
+  /// method assumes that taskframes are in canonical form and that
+  /// findTaskFrameTree() has run.
+  bool foundChildTaskFrames() const { return TaskFrameRoots.empty(); }
 
   /// Return the detach instruction that created this task, or nullptr if this
   /// task is a root task.
@@ -1179,6 +1193,12 @@ public:
   bool isSerial() const {
     assert(getRootTask() && "Null root task\n");
     return getRootTask()->isSerial();
+  }
+
+  /// Return true if the analysis found child taskframes of this task.
+  bool foundChildTaskFrames() const {
+    assert(getRootTask() && "Null root task\n");
+    return getRootTask()->foundChildTaskFrames();
   }
 
   /// iterator/begin/end - The interface to the top-level tasks in the current

@@ -2782,6 +2782,11 @@ void SelectionDAGBuilder::visitInvoke(const InvokeInst &I) {
       llvm_unreachable("SelectionDAGBuilder shouldn't visit detached_rethrow "
                        "instructions!");
       break;
+    case Intrinsic::taskframe_resume:
+      // Treat detached_rethrow intrinsics like resumes.
+      llvm_unreachable("SelectionDAGBuilder shouldn't visit taskframe_resume "
+                       "instructions!");
+      break;
     case Intrinsic::sync_unwind:
       // Treat sync_unwind intrinsics like donothing: ignore them and jump
       // directly to the next BB.
@@ -6899,6 +6904,9 @@ void SelectionDAGBuilder::visitIntrinsicCall(const CallInst &I,
     break;
   case Intrinsic::taskframe_use:
     // Discard any taskframe.uses.
+    break;
+  case Intrinsic::taskframe_end:
+    // Discard any taskframe.ends.
     break;
   case Intrinsic::sync_unwind:
     // Discard any sync.unwinds.

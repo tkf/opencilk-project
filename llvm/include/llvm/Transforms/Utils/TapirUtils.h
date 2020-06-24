@@ -56,6 +56,20 @@ BasicBlock *getTaskFrameResumeDest(Value *TaskFrame);
 /// uses \p SyncRegion.
 bool isSyncUnwind(const Instruction *I, const Value *SyncRegion = nullptr);
 
+/// Returns true if BasicBlock \p B is a placeholder successor, that is, it's
+/// the immediate successor of only detached-rethrow and taskframe-resume
+/// instructions.
+bool isPlaceholderSuccessor(const BasicBlock *B);
+
+/// Returns true if the given basic block ends a taskframe, false otherwise.  If
+/// \p TaskFrame is specified, then additionally checks that the
+/// taskframe.end uses \p TaskFrame.
+bool endsTaskFrame(const BasicBlock *B, const Value *TaskFrame = nullptr);
+
+/// Returns the spindle containing the taskframe.create used by task \p T, or
+/// the entry spindle of \p T if \p T has no such taskframe.create spindle.
+Spindle *getTaskFrameForTask(Task *T);
+
 // Removes the given sync.unwind instruction, if it is dead.  Returns true if
 // the sync.unwind was removed, false otherwise.
 bool removeDeadSyncUnwind(CallBase *SyncUnwind);
@@ -113,6 +127,11 @@ BranchInst *SerializeDetachedCFG(DetachInst *DI, DominatorTree *DT = nullptr);
 /// the specified block.
 const BasicBlock *GetDetachedCtx(const BasicBlock *BB);
 BasicBlock *GetDetachedCtx(BasicBlock *BB);
+
+// Returns true if the function may not be synced at the point of the given
+// basic block, false otherwise.  This function does a simple depth-first
+// traversal of the CFG, and as such, produces a conservative result.
+bool mayBeUnsynced(const BasicBlock *BB);
 
 /// isCriticalContinueEdge - Return true if the specified edge is a critical
 /// detach-continue edge.  Critical detach-continue edges are critical edges -
@@ -180,6 +199,12 @@ BasicBlock *CreateSubTaskUnwindEdge(Intrinsic::ID TermFunc, Value *Token,
 /// convert calls to invokes, recursively traversing tasks and taskframes to
 /// insert appropriate detached.rethrow and taskframe.resume terminators.
 void promoteCallsInTasksToInvokes(Function &F, const Twine Name = "cleanup");
+
+/// eraseTaskFrame - Remove the specified taskframe and all uses of it.  The
+/// given \p TaskFrame should correspond to a taskframe.create call.  The
+/// DominatorTree \p DT is updated to reflect changes to the CFG, if \p DT is
+/// not null.
+void eraseTaskFrame(Value *TaskFrame, DominatorTree *DT = nullptr);
 
 /// Utility class for getting and setting Tapir-related loop hints in the form
 /// of loop metadata.

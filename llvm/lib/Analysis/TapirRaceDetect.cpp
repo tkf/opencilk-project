@@ -389,6 +389,14 @@ static bool checkInstructionForRace(const Instruction *I,
     if (isa<DbgInfoIntrinsic>(I))
       return false;
 
+    // Check for detached.rethrow, taskframe.resume, or sync.unwind, which might
+    // be invoked.
+    if (const Function *Called = Call->getCalledFunction())
+      if (Intrinsic::detached_rethrow == Called->getIntrinsicID() ||
+          Intrinsic::taskframe_resume == Called->getIntrinsicID() ||
+          Intrinsic::sync_unwind == Called->getIntrinsicID())
+        return false;
+
     // Ignore other intrinsics.
     if (const IntrinsicInst *II = dyn_cast<IntrinsicInst>(I))
       // TODO: Exclude all intrinsics for which
@@ -410,6 +418,7 @@ static bool checkInstructionForRace(const Instruction *I,
       case Intrinsic::syncregion_start:
       case Intrinsic::taskframe_create:
       case Intrinsic::taskframe_use:
+      case Intrinsic::taskframe_end:
       case Intrinsic::taskframe_load_guard:
       case Intrinsic::sync_unwind:
         return false;
@@ -771,6 +780,11 @@ bool AccessPtrAnalysis::checkDependence(std::unique_ptr<Dependence> D,
       break;
     }
   }
+
+  // If we didn't find any base objects, we have no common-object loop.
+  if (BaseObjs.empty())
+    CommonObjLoop = nullptr;
+
   // Set MinObjDepth to 0 if there are not base objects to check.
   if (BaseObjs.empty() || !CommonObjLoop)
     MinObjDepth = 0;

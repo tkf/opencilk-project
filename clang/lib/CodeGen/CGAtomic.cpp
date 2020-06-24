@@ -761,6 +761,10 @@ RValue CodeGenFunction::EmitAtomicExpr(AtomicExpr *E) {
     return RValue::get(nullptr);
   }
 
+  // RAII to finish detach scope after processing AtomicExpr E, if E uses a
+  // spawned value.
+  DetachScopeRAII DetScope(*this);
+
   CharUnits sizeChars, alignChars;
   std::tie(sizeChars, alignChars) = getContext().getTypeInfoInChars(AtomicTy);
   uint64_t Size = sizeChars.getQuantity();

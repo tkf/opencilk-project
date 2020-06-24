@@ -411,11 +411,6 @@ private:
 
   DenseMap<DetachInst *, SmallVector<SyncInst *, 2>> DetachToSync;
 
-  SmallPtrSet<const Function *, 8> LocalNoRecurseFunctions;
-  bool FunctionIsNoRecurse(const Function &F) const {
-    return (F.doesNotRecurse() || LocalNoRecurseFunctions.count(&F));
-  }
-
   bool LocalBaseObj(const Value *Addr, LoopInfo *LI,
                     const TargetLibraryInfo *TLI) const;
   bool PossibleRaceByCapture(const Value *Addr, const TaskInfo &TI,
@@ -640,63 +635,6 @@ using SCCNodeSet = SmallSetVector<Function *, 8>;
 
 } // end anonymous namespace
 
-static bool InstrBreaksNoRecurse(Instruction &I, const SCCNodeSet &SCCNodes,
-                                 SmallPtrSetImpl<const Function *>
-                                 &LocalNoRecurFns) {
-  Function *F = *SCCNodes.begin();
-  if (F->doesNotRecurse())
-    return false;
-
-  if (auto CS = CallSite(&I)) {
-    if (isa<DbgInfoIntrinsic>(I))
-      return false;
-
-    if (isDetachedRethrow(&I) || isTaskFrameResume(&I) || isSyncUnwind(&I))
-      return false;
-
-    const Function *Callee = CS.getCalledFunction();
-    if (!Callee || Callee == F || (!Callee->doesNotRecurse() &&
-                                   !LocalNoRecurFns.count(Callee))) {
-      if (Callee && Callee != F) {
-        switch (Callee->getIntrinsicID()) {
-        default: return true;
-        case Intrinsic::annotation:
-        case Intrinsic::assume:
-        case Intrinsic::sideeffect:
-        case Intrinsic::invariant_start:
-        case Intrinsic::invariant_end:
-        case Intrinsic::launder_invariant_group:
-        case Intrinsic::strip_invariant_group:
-        case Intrinsic::is_constant:
-        case Intrinsic::lifetime_start:
-        case Intrinsic::lifetime_end:
-        case Intrinsic::objectsize:
-        case Intrinsic::ptr_annotation:
-        case Intrinsic::var_annotation:
-        case Intrinsic::experimental_gc_result:
-        case Intrinsic::experimental_gc_relocate:
-        case Intrinsic::coro_alloc:
-        case Intrinsic::coro_begin:
-        case Intrinsic::coro_free:
-        case Intrinsic::coro_end:
-        case Intrinsic::coro_frame:
-        case Intrinsic::coro_size:
-        case Intrinsic::coro_suspend:
-        case Intrinsic::coro_param:
-        case Intrinsic::coro_subfn_addr:
-        case Intrinsic::syncregion_start:
-        case Intrinsic::taskframe_create:
-        case Intrinsic::taskframe_use:
-        case Intrinsic::taskframe_load_guard:
-          return false;
-        }
-      }
-      return true;
-    }
-  }
-  return false;
-}
-
 bool CilkSanitizerImpl::run() {
   // Initialize components of the CSI and Cilksan system.
   initializeCsi();
@@ -707,45 +645,6 @@ bool CilkSanitizerImpl::run() {
   // Evaluate the SCC's in the callgraph in post order to support
   // interprocedural analysis of potential races in the module.
   SmallVector<Function *, 16> InstrumentedFunctions;
-
-  // Fill SCCNodes with the elements of the SCC. Used for quickly looking up
-  // whether a given CallGraphNode is in this SCC. Also track whether there are
-  // any external or opt-none nodes that will prevent us from optimizing any
-  // part of the SCC.
-  for (scc_iterator<CallGraph *> I = scc_begin(CG); !I.isAtEnd(); ++I) {
-    const std::vector<CallGraphNode *> &SCC = *I;
-    SCCNodeSet SCCNodes;
-    for (CallGraphNode *N : SCC) {
-      Function *F = N->getFunction();
-      if (F)
-        SCCNodes.insert(F);
-    }
-    // Infer our own version of the norecurse attribute.  The norecurse
-    // attribute requires an exact definition of the function, and therefore
-    // does not get inferred on functions with weak or linkonce linkage.
-    // However, CilkSanitizer only requires this attribute in propagating
-    // analysis information across function boundaries.  Any alternative
-    // implementation of said function can simply propagate such information
-    // differently.  So CilkSanitizer infers the norecurse attribute itself,
-    // without the requirement of an exact definition.
-    AttributeInferer AI;
-    AI.registerAttrInference(AttributeInferer::InferenceDescriptor{
-        Attribute::NoRecurse,
-            // Skip functions already marked norecurse.
-            [](const Function &F) { return F.doesNotRecurse(); },
-            // Instructions that break NoRecurse
-            [this, SCCNodes](Instruction &I) {
-              return InstrBreaksNoRecurse(I, SCCNodes, LocalNoRecurseFunctions);
-            },
-            [this](Function &F) {
-              LLVM_DEBUG(dbgs() << "Setting function " << F.getName()
-                                << " as locally norecurse.\n");
-              LocalNoRecurseFunctions.insert(&F);
-            },
-            /* RequiresExactDefinition = */ false});
-    // Derive any local function attributes we want.
-    AI.run(SCCNodes);
-  }
 
   // Instrument functions.
   for (scc_iterator<CallGraph *> I = scc_begin(CG); !I.isAtEnd(); ++I) {
@@ -1150,18 +1049,6 @@ static void setupBlock(BasicBlock *BB, DominatorTree *DT,
 
   BasicBlock *BBToSplit = BB;
   // Split off the predecessors of each type.
-  if (!DetachPreds.empty() && NumPredTypes > 1) {
-    BBToSplit = SplitOffPreds(BBToSplit, DetachPreds, DT);
-    NumPredTypes--;
-  }
-  if (!DetRethrowPreds.empty() && NumPredTypes > 1) {
-    BBToSplit = SplitOffPreds(BBToSplit, DetRethrowPreds, DT);
-    NumPredTypes--;
-  }
-  if (!TFResumePreds.empty() && NumPredTypes > 1) {
-    BBToSplit = SplitOffPreds(BBToSplit, TFResumePreds, DT);
-    NumPredTypes--;
-  }
   if (!SyncPreds.empty() && NumPredTypes > 1) {
     BBToSplit = SplitOffPreds(BBToSplit, SyncPreds, DT);
     NumPredTypes--;
@@ -1178,6 +1065,24 @@ static void setupBlock(BasicBlock *BB, DominatorTree *DT,
     BBToSplit = SplitOffPreds(BBToSplit, InvokePreds, DT);
     NumPredTypes--;
   }
+  if (!TFResumePreds.empty() && NumPredTypes > 1) {
+    BBToSplit = SplitOffPreds(BBToSplit, TFResumePreds, DT);
+    NumPredTypes--;
+  }
+  // We handle detach and detached.rethrow predecessors at the end to preserve
+  // invariants on the CFG structure about the deadness of basic blocks after
+  // detached-rethrows.
+  if (!DetachPreds.empty() && NumPredTypes > 1) {
+    BBToSplit = SplitOffPreds(BBToSplit, DetachPreds, DT);
+    NumPredTypes--;
+  }
+  // There is no need to split off detached-rethrow predecessors, since those
+  // successors of a detached-rethrow are dead up to where control flow merges
+  // with the unwind destination of a detach.
+  // if (!DetRethrowPreds.empty() && NumPredTypes > 1) {
+  //   BBToSplit = SplitOffPreds(BBToSplit, DetRethrowPreds, DT);
+  //   NumPredTypes--;
+  // }
 }
 
 // Setup all basic blocks such that each block's predecessors belong entirely to
@@ -1703,30 +1608,6 @@ void CilkSanitizerImpl::Instrumentor::InsertArgSuppressionFlags(Function &F,
       if (Arg.hasNoAliasAttr())
         LocalSV |= static_cast<unsigned>(SuppressionVal::NoAlias);
 
-      // if (!F.hasFnAttribute(Attribute::NoRecurse) &&
-      if (!CilkSanImpl.FunctionIsNoRecurse(F) &&
-          RI.ObjectInvolvedInRace(&Arg)) {
-        LLVM_DEBUG(dbgs() << "Setting local SV in may-recurse function " <<
-                   F.getName() << " for arg " << Arg << "\n");
-        // This function might recursively call itself, so incorporate
-        // information we have about how this function reads or writes its own
-        // arguments into these suppression flags.
-        ModRefInfo ArgMR = RI.GetObjectMRForRace(&Arg);
-        // TODO: Possibly make these checks more precise using information we
-        // get from instrumenting functions previously.
-        if (isRefSet(ArgMR)) {
-          LLVM_DEBUG(dbgs() << "  Setting Mod\n");
-          // If ref is set, then race detection found a local instruction that
-          // might write arg, so we assume arg is modified.
-          LocalSV |= static_cast<unsigned>(SuppressionVal::Mod);
-        }
-        if (isModSet(ArgMR)) {
-          LLVM_DEBUG(dbgs() << "  Setting Ref\n");
-          // If mod is set, then race detection found a local instruction that
-          // might read or write  arg, so we assume arg is read.
-          LocalSV |= static_cast<unsigned>(SuppressionVal::Ref);
-        }
-      }
       // Store this local suppression value.
       FinalSV = IRB.CreateOr(getSuppressionIRValue(IRB, LocalSV),
                              IRB.CreateLoad(NewFlag));
@@ -1753,9 +1634,11 @@ void CilkSanitizerImpl::Instrumentor::InsertArgSuppressionFlags(Function &F,
       // Determine if this object is no-alias.
       //
       // TODO: Figure out what "no-alias" information we can derive for allocas.
-      if (const CallBase *CB = dyn_cast<CallBase>(ObjRD.first))
+      if (const CallBase *CB = dyn_cast<CallBase>(ObjRD.first)) {
         if (CB->hasRetAttr(Attribute::NoAlias))
           SupprVal |= static_cast<unsigned>(SuppressionVal::NoAlias);
+      } else if (isa<AllocaInst>(ObjRD.first))
+        SupprVal |= static_cast<unsigned>(SuppressionVal::NoAlias);
 
       LLVM_DEBUG(dbgs() << "Setting LocalSuppressions for " << *ObjRD.first
                  << " = " << SupprVal << "\n");
@@ -1775,14 +1658,14 @@ bool CilkSanitizerImpl::Instrumentor::InstrumentSimpleInstructions(
 
     // If the instruction might participate in a local or opaque race,
     // instrument it unconditionally.
-    if (RI.mightRaceOpaquely(I) || RI.mightRaceLocally(I)) {
+    if (RI.mightRaceOpaquely(I)) {
       if (isa<LoadInst>(I) || isa<StoreInst>(I))
         LocalResult |= CilkSanImpl.instrumentLoadOrStore(I);
       else if (isa<AtomicRMWInst>(I) || isa<AtomicCmpXchgInst>(I))
         LocalResult |= CilkSanImpl.instrumentAtomic(I);
       else
         dbgs() << "[Cilksan] Unknown simple instruction: " << *I << "\n";
-    } else if (RI.mightRaceViaAncestor(I)) {
+    } else if (RI.mightRaceViaAncestor(I) || RI.mightRaceLocally(I)) {
       // Otherwise, if the instruction might participate in a race via an
       // ancestor function instantiation, instrument it conditionally, based on
       // the pointer.
@@ -1819,10 +1702,11 @@ bool CilkSanitizerImpl::Instrumentor::InstrumentAnyMemIntrinsics(
     SmallSet<std::pair<Instruction *, unsigned>, 2> MaybeDelay;
     for (const RaceInfo::RaceData &RD : RI.getRaceData(I)) {
       assert(RD.getPtr() && "No pointer for race with memory intrinsic.");
-      if (RaceInfo::isLocalRace(RD.Type) || RaceInfo::isOpaqueRace(RD.Type)) {
+      if (RaceInfo::isOpaqueRace(RD.Type)) {
         ToInstrument.insert(std::make_pair(I, RD.OperandNum));
         LocalResult |= true;
-      } else if (RaceInfo::isRaceViaAncestor(RD.Type)) {
+      } else if (RaceInfo::isRaceViaAncestor(RD.Type) ||
+                 RaceInfo::isLocalRace(RD.Type)) {
         // Possibly delay handling this instruction.
         MaybeDelay.insert(std::make_pair(I, RD.OperandNum));
         LocalResult |= true;
@@ -1863,7 +1747,7 @@ bool CilkSanitizerImpl::Instrumentor::InstrumentCalls(
     // Get current race data for this call.
     RaceInfo::RaceType CallRT = RI.getRaceType(I);
     LLVM_DEBUG({
-        dbgs() << "Call " << *I << ":";
+        dbgs() << "Call " << *I << ": ";
         RaceInfo::printRaceType(CallRT, dbgs());
         dbgs() << "\n";
       });
@@ -1876,7 +1760,7 @@ bool CilkSanitizerImpl::Instrumentor::InstrumentCalls(
         FuncRT = CilkSanImpl.FunctionRaceType[CF];
 
     LLVM_DEBUG({
-        dbgs() << "  FuncRT:";
+        dbgs() << "  FuncRT: ";
         RaceInfo::printRaceType(FuncRT, dbgs());
         dbgs() << "\n";
       });
@@ -1886,7 +1770,7 @@ bool CilkSanitizerImpl::Instrumentor::InstrumentCalls(
       CallRT = RaceInfo::clearOpaqueRace(CallRT);
 
     LLVM_DEBUG({
-        dbgs() << "  New CallRT:";
+        dbgs() << "  New CallRT: ";
         RaceInfo::printRaceType(CallRT, dbgs());
         dbgs() << "\n";
       });
@@ -1915,47 +1799,43 @@ bool CilkSanitizerImpl::Instrumentor::InstrumentCalls(
     SmallVector<Value *, 8> SupprVals;
     LLVM_DEBUG(dbgs() << "Getting suppression values for " << *CB << "\n");
     IRBuilder<> IRB(I);
-    if (RaceInfo::isRaceViaAncestor(CallRT)) {
-      // Otherwise, if the instruction might participate in a race via an
-      // ancestor function instantiation, instrument it conditionally based on
-      // the pointer.
-      unsigned OpIdx = 0;
-      for (const Value *Op : CB->args()) {
-        if (!Op->getType()->isPtrOrPtrVectorTy()) {
-          ++OpIdx;
-          continue;
-        }
-        Value *SupprVal = getSuppressionValue(I, IRB, OpIdx);
-        LLVM_DEBUG({
-            dbgs() << "  Op: " << *CB->getArgOperand(OpIdx) << "\n";
-            dbgs() << "  Suppression value: " << *SupprVal << "\n";
-          });
-        SupprVals.push_back(SupprVal);
+    unsigned OpIdx = 0;
+    for (const Value *Op : CB->args()) {
+      if (!Op->getType()->isPtrOrPtrVectorTy()) {
         ++OpIdx;
+        continue;
       }
-    } else {
-      // We have either an opaque race or a local race, but _not_ a race via an
-      // ancestor.  We want to propagate suppression information on pointer
-      // arguments, but we don't need to be pessimistic when a value can't be
-      // found.
-      unsigned OpIdx = 0;
-      for (const Value *Op : CB->args()) {
-        if (!Op->getType()->isPtrOrPtrVectorTy()) {
-          ++OpIdx;
+
+      // Check if this operand might race via ancestor.
+      bool RaceViaAncestor = false;
+      for (const RaceInfo::RaceData &RD : RI.getRaceData(I)) {
+        if (RD.OperandNum != OpIdx)
           continue;
+        if (RaceInfo::isRaceViaAncestor(RD.Type)) {
+          RaceViaAncestor = true;
+          break;
         }
-        // Value *SupprVal = IRB.getInt8(SuppressionVal::NoAccess);
-        Value *SupprVal = getSuppressionValue(I, IRB, OpIdx,
-                                              SuppressionVal::NoAccess,
-                                              /*CheckArgs=*/ false);
-        LLVM_DEBUG({
-            dbgs() << "  Op: " << *CB->getArgOperand(OpIdx) << "\n";
-            dbgs() << "  Suppression value: " << *SupprVal << "\n";
-          });
-        SupprVals.push_back(SupprVal);
-        ++OpIdx;
       }
+
+      Value *SupprVal;
+      if (RaceViaAncestor)
+        // Evaluate race data for I and OpIdx to compute the suppression value.
+        SupprVal = getSuppressionValue(I, IRB, OpIdx);
+      else
+        // We have either an opaque race or a local race, but _not_ a race via
+        // an ancestor.  We want to propagate suppression information on pointer
+        // arguments, but we don't need to be pessimistic when a value can't be
+        // found.
+        SupprVal = getSuppressionValue(I, IRB, OpIdx, SuppressionVal::NoAccess,
+                                       /*CheckArgs=*/ false);
+      LLVM_DEBUG({
+          dbgs() << "  Op: " << *CB->getArgOperand(OpIdx) << "\n";
+          dbgs() << "  Suppression value: " << *SupprVal << "\n";
+        });
+      SupprVals.push_back(SupprVal);
+      ++OpIdx;
     }
+
     Value *CalleeID = CilkSanImpl.GetCalleeFuncID(CB->getCalledFunction(), IRB);
     // We set the suppression flags in reverse order to support stack-like
     // accesses of the flags by in-order calls to GetSuppressionFlag in the
@@ -2023,11 +1903,14 @@ static MemoryLocation getMemoryLocation(Instruction *I, unsigned OperandNum,
   }
 }
 
+// Evaluate the no-alias value in the suppression for Obj, and intersect that
+// result with the noalias information for other objects.
 Value *CilkSanitizerImpl::Instrumentor::getNoAliasSuppressionValue(
     Instruction *I, IRBuilder<> &IRB, unsigned OperandNum,
     MemoryLocation Loc, const RaceInfo::RaceData &RD, const Value *Obj,
     Value *ObjNoAliasFlag) {
   AliasAnalysis *AA = RI.getAA();
+
   for (const RaceInfo::RaceData &OtherRD : RI.getRaceData(I)) {
     // Skip checking other accesses that don't involve a pointer
     if (!OtherRD.Access.getPointer())
@@ -2035,6 +1918,7 @@ Value *CilkSanitizerImpl::Instrumentor::getNoAliasSuppressionValue(
     // Skip this operand when scanning for aliases
     if (OperandNum == OtherRD.OperandNum)
       continue;
+
     // If we can tell statically that these two memory locations don't alias,
     // move on.
     if (!AA->alias(Loc, getMemoryLocation(I, OtherRD.OperandNum,
@@ -2089,7 +1973,6 @@ Value *CilkSanitizerImpl::Instrumentor::getNoAliasSuppressionValue(
   return ObjNoAliasFlag;
 }
 
-// TODO: Combine the logic of getSuppressionValue and getSuppressionCheck.
 Value *CilkSanitizerImpl::Instrumentor::getSuppressionValue(
     Instruction *I, IRBuilder<> &IRB, unsigned OperandNum,
     SuppressionVal DefaultSV, bool CheckArgs) {
@@ -2100,37 +1983,98 @@ Value *CilkSanitizerImpl::Instrumentor::getSuppressionValue(
       IRB, static_cast<unsigned>(SuppressionVal::NoAccess));
   Value *DefaultSuppression = getSuppressionIRValue(
       IRB, static_cast<unsigned>(DefaultSV));
-
-  // // Check the other operands of this call to check for aliasing, e.g., because
-  // // the same pointer is passed twice.
-  // bool OperandMayAlias = false;
-  // for (const RaceInfo::RaceData &OtherRD : RI.getRaceData(I)) {
-  //   // Skip this operand when scanning for aliases
-  //   if (OperandNum == OtherRD.OperandNum)
-  //     continue;
-  //   // Check for aliasing.
-  //   if (OtherRD.OperandNum != static_cast<unsigned>(-1))
-  //     if (AA->alias(Loc, getMemoryLocation(I, OtherRD.OperandNum,
-  //                                          CilkSanImpl.TLI)))
-  //       OperandMayAlias = true;
-  // }
-
-  // bool ObjectsDontAlias = true;
   Value *NoAliasFlag = getSuppressionIRValue(
       IRB, static_cast<unsigned>(SuppressionVal::NoAlias));
+
+  // If I is a call, check if any other arguments of this call alias the
+  // specified operand.
+  if (const CallBase *CB = dyn_cast<CallBase>(I)) {
+    unsigned OpIdx = 0;
+    bool FoundAliasingArg = false;
+    for (const Value *Arg : CB->args()) {
+      // Skip this operand and any operands that are not pointers.
+      if (OpIdx == OperandNum ||
+          !Arg->getType()->isPtrOrPtrVectorTy()) {
+        ++OpIdx;
+        continue;
+      }
+
+      // If this argument does not alias Loc, skip it.
+      if (!AA->alias(Loc, getMemoryLocation(I, OpIdx, CilkSanImpl.TLI))) {
+        ++OpIdx;
+        continue;
+      }
+
+      // If the operands must alias, then discard the default noalias
+      // suppression value.
+      AliasResult ArgAlias =
+          AA->alias(Loc, getMemoryLocation(I, OpIdx, CilkSanImpl.TLI));
+      if (MustAlias == ArgAlias || PartialAlias == ArgAlias) {
+        NoAliasFlag = getSuppressionIRValue(IRB, 0);
+        break;
+      }
+
+      // Get objects corresponding to this argument.
+      SmallPtrSet<const Value *, 1> ArgObjects;
+      RI.getObjectsFor(RaceInfo::MemAccessInfo(
+                           Arg, isModSet(AA->getArgModRefInfo(CB, OpIdx))),
+                       ArgObjects);
+      for (const Value *Obj : ArgObjects) {
+        // If Loc and the racer object cannot alias, then there's nothing to
+        // check.
+        if (!AA->alias(Loc, MemoryLocation(Obj)))
+          continue;
+
+        // If we have no local suppression data for Obj, then act pessimally.
+        if (!LocalSuppressions.count(Obj)) {
+          FoundAliasingArg = true;
+          break;
+        }
+
+        // Intersect the dynamic noalias information for this object into the
+        // noalias flag.
+        Value *FlagLoad = readSuppressionVal(LocalSuppressions[Obj], IRB);
+        Value *ObjNoAliasFlag = IRB.CreateAnd(
+            FlagLoad, getSuppressionIRValue(
+                IRB, static_cast<unsigned>(SuppressionVal::NoAlias)));
+        NoAliasFlag = IRB.CreateAnd(NoAliasFlag, ObjNoAliasFlag);
+      }
+
+      if (FoundAliasingArg) {
+        // If we found an aliasing argument, fall back to noalias = false.
+        NoAliasFlag = getSuppressionIRValue(IRB, 0);
+        break;
+      }
+      ++OpIdx;
+    }
+  }
+
   // Check the recorded race data for I.
   for (const RaceInfo::RaceData &RD : RI.getRaceData(I)) {
     // Skip race data for different operands of the same instruction.
     if (OperandNum != RD.OperandNum)
       continue;
 
+    // Otherwise use information about the possibly accessed objects to
+    // determine the suppression value.
     SmallPtrSet<const Value *, 1> Objects;
     RI.getObjectsFor(RD.Access, Objects);
-    // // Add objects to CilkSanImpl.ObjectMRForRace, to ensure ancillary
-    // // instrumentation is added.
-    // for (Value *Obj : Objects)
-    //   if (!CilkSanImpl.ObjectMRForRace.count(Obj))
-    //     CilkSanImpl.ObjectMRForRace[Obj] = ModRefInfo::ModRef;
+
+    // If we have a valid racer, get the objects that that racer might access.
+    SmallPtrSet<const Value *, 1> RacerObjects;
+    unsigned LocalRaceVal =
+        static_cast<unsigned>(SuppressionVal::NoAccess);
+    if (RD.Racer.isValid()) {
+      // Get the local race value for this racer
+      assert(RaceInfo::isLocalRace(RD.Type) && "Valid racer for nonlocal race");
+      RI.getObjectsFor(RaceInfo::MemAccessInfo(RD.Racer.getPtr(),
+                                               RD.Racer.isMod()),
+                       RacerObjects);
+      if (RD.Racer.isMod())
+        LocalRaceVal |= static_cast<unsigned>(SuppressionVal::Mod);
+      if (RD.Racer.isRef())
+        LocalRaceVal |= static_cast<unsigned>(SuppressionVal::Ref);
+    }
 
     // Get suppressions from objects
     for (const Value *Obj : Objects) {
@@ -2138,6 +2082,8 @@ Value *CilkSanitizerImpl::Instrumentor::getSuppressionValue(
       if (!LocalSuppressions.count(Obj)) {
         LLVM_DEBUG(dbgs() << "No local suppression found for obj " << *Obj
                    << "\n");
+        if (RD.Racer.isValid())
+          return getSuppressionIRValue(IRB, LocalRaceVal);
         return DefaultSuppression;
       }
 
@@ -2145,7 +2091,6 @@ Value *CilkSanitizerImpl::Instrumentor::getSuppressionValue(
       Value *FlagCheck = IRB.CreateAnd(
           FlagLoad, getSuppressionIRValue(IRB, RaceTypeToFlagVal(RD.Type)));
       SV = IRB.CreateOr(SV, FlagCheck);
-      // SV = IRB.CreateOr(SV, FlagLoad);
 
       // Get the dynamic no-alias bit from the suppression value.
       Value *ObjNoAliasFlag = IRB.CreateAnd(
@@ -2154,7 +2099,53 @@ Value *CilkSanitizerImpl::Instrumentor::getSuppressionValue(
       Value *NoAliasCheck = IRB.CreateICmpNE(getSuppressionIRValue(IRB, 0),
                                              ObjNoAliasFlag);
 
-      if (CheckArgs) {
+      if (RD.Racer.isValid()) {
+        for (const Value *RObj : RacerObjects) {
+          // If the racer object matches Obj, there's no need to check a flag.
+          if (RObj == Obj) {
+            SV = IRB.CreateOr(SV, LocalRaceVal);
+            continue;
+          }
+
+          // If Loc and the racer object cannot alias, then there's nothing to
+          // check.
+          if (!AA->alias(Loc, MemoryLocation(RObj)))
+              continue;
+
+          // If there is must or partial aliasing between this object and racer
+          // object, or we have no local suppression information for RObj, then
+          // act conservatively, because there's nothing to check.
+          if (MustAlias == AA->alias(Loc, MemoryLocation(RObj)) ||
+              PartialAlias == AA->alias(Loc, MemoryLocation(RObj)) ||
+              !LocalSuppressions.count(RObj)) {
+            if (!LocalSuppressions.count(RObj))
+              LLVM_DEBUG(dbgs() << "No local suppression found for racer object "
+                         << *RObj << "\n");
+            else
+              LLVM_DEBUG(dbgs() << "AA indicates must or partial alias with "
+                         "racer object " << *RObj << "\n");
+            SV = IRB.CreateOr(SV, LocalRaceVal);
+            continue;
+          }
+
+          // These two objects may alias, based on static analysis.  Check the
+          // dynamic suppression values.  We can suppress the race if either
+          // this object or the racer object is dynamically noalias, i.e., if
+          // either was derived from an allocation or noalias function argument.
+          Value *FlagLoad = readSuppressionVal(LocalSuppressions[RObj], IRB);
+          Value *RObjNoAliasFlag = IRB.CreateAnd(
+              FlagLoad, getSuppressionIRValue(
+                  IRB, static_cast<unsigned>(SuppressionVal::NoAlias)));
+          Value *RObjNoAliasCheck = IRB.CreateICmpNE(
+              getSuppressionIRValue(IRB, 0), RObjNoAliasFlag);
+          Value *FlagCheck = IRB.CreateSelect(
+              IRB.CreateOr(NoAliasCheck, RObjNoAliasCheck),
+              getSuppressionIRValue(IRB, 0),
+              IRB.CreateAnd(FlagLoad,
+                            getSuppressionIRValue(IRB, LocalRaceVal)));
+          SV = IRB.CreateOr(SV, FlagCheck);
+        }
+      } else if (CheckArgs) {
         // Check the function arguments that might alias this object.
         for (Argument &Arg : F->args()) {
           // Ignore non-pointer arguments
@@ -2167,55 +2158,32 @@ Value *CilkSanitizerImpl::Instrumentor::getSuppressionValue(
           if (!AA->alias(Loc, MemoryLocation(&Arg)))
             continue;
           // If we have no local suppression information about the argument,
-          // give up.
+          // then there's nothing to check.
           if (!LocalSuppressions.count(&Arg)) {
             LLVM_DEBUG(dbgs() << "No local suppression found for arg " << Arg
                        << "\n");
             return DefaultSuppression;
           }
 
+          // These two objects may alias, based on static analysis.  Check the
+          // dynamic suppression values.  We can suppress the race if either
+          // this object or the racer object is dynamically noalias, i.e., if
+          // either was derived from an allocation or noalias function argument.
           Value *FlagLoad = readSuppressionVal(LocalSuppressions[&Arg], IRB);
+          Value *ArgNoAliasFlag = IRB.CreateAnd(
+              FlagLoad, getSuppressionIRValue(
+                  IRB, static_cast<unsigned>(SuppressionVal::NoAlias)));
+          Value *ArgNoAliasCheck = IRB.CreateICmpNE(
+              getSuppressionIRValue(IRB, 0), ArgNoAliasFlag);
           Value *FlagCheck = IRB.CreateSelect(
-              NoAliasCheck, getSuppressionIRValue(IRB, 0),
+              IRB.CreateOr(NoAliasCheck, ArgNoAliasCheck),
+              getSuppressionIRValue(IRB, 0),
               IRB.CreateAnd(
                   FlagLoad, getSuppressionIRValue(IRB,
                                                   RaceTypeToFlagVal(RD.Type))));
           SV = IRB.CreateOr(SV, FlagCheck);
-          // Value *FlagCheck = IRB.CreateAnd(
-          //     FlagLoad, getSuppressionIRValue(IRB, RaceTypeToFlagVal(RD.Type)));
-          // SV = IRB.CreateOr(SV, FlagCheck);
         }
       }
-
-      // // Check for noalias attributes to determine if we can set the noalias
-      // // suppression bit in this value (at this call).
-      // bool ObjNoAlias = false;
-      // if (Argument *Arg = dyn_cast<Argument>(Obj))
-      //   ObjNoAlias = Arg->hasNoAliasAttr();
-      // else if (CallBase *CB = dyn_cast<CallBase>(Obj))
-      //   ObjNoAlias = CB->hasRetAttr(Attribute::NoAlias);
-      // ObjNoAliasFlag = IRB.CreateOr(
-      //     ObjNoAliasFlag,
-      //     getSuppressionIRValue(IRB, ObjNoAlias ? SuppressionVal::NoAlias : 0));
-
-      // // Look for instances of the same object
-      // //
-      // // TODO: Possibly optimize this quadratic algorithm, if it proves to be a
-      // // problem.
-      // for (const RaceInfo::RaceData &OtherRD : RI.getRaceData(I)) {
-      //   // Skip this operand when scanning for aliases
-      //   if (OperandNum == OtherRD.OperandNum)
-      //     continue;
-      //   SmallPtrSet<Value *, 1> OtherObjects;
-      //   RI.getObjectsFor(OtherRD.Access, OtherObjects);
-      //   for (Value *OtherObj : OtherObjects) {
-      //     // If we find another instance of this object in another argument,
-      //     // then we don't have "no alias".
-      //     if (Obj == OtherObj)
-      //       ObjNoAliasFlag = getSuppressionIRValue(IRB, 0);
-      //   }
-      // }
-
       // Call getNoAliasSuppressionValue to evaluate the no-alias value in the
       // suppression for Obj, and intersect that result with the noalias
       // information for other objects.
@@ -2232,6 +2200,7 @@ Value *CilkSanitizerImpl::Instrumentor::getSuppressionValue(
 Value *CilkSanitizerImpl::Instrumentor::getSuppressionCheck(
     Instruction *I, IRBuilder<> &IRB, unsigned OperandNum) {
   Function *F = I->getFunction();
+  bool LocalRace = RI.mightRaceLocally(I);
   AliasAnalysis *AA = RI.getAA();
   MemoryLocation Loc = getMemoryLocation(I, OperandNum, CilkSanImpl.TLI);
   Value *SuppressionChk = IRB.getTrue();
@@ -2243,6 +2212,22 @@ Value *CilkSanitizerImpl::Instrumentor::getSuppressionCheck(
 
     SmallPtrSet<const Value *, 1> Objects;
     RI.getObjectsFor(RD.Access, Objects);
+
+    // If we have a valid racer, get the objects that that racer might access.
+    SmallPtrSet<const Value *, 1> RacerObjects;
+    unsigned LocalRaceVal =
+        static_cast<unsigned>(SuppressionVal::NoAccess);
+    if (RD.Racer.isValid()) {
+      assert(RaceInfo::isLocalRace(RD.Type) && "Valid racer for nonlocal race");
+      RI.getObjectsFor(RaceInfo::MemAccessInfo(RD.Racer.getPtr(),
+                                               RD.Racer.isMod()),
+                       RacerObjects);
+      if (RD.Racer.isMod())
+        LocalRaceVal |= static_cast<unsigned>(SuppressionVal::Mod);
+      if (RD.Racer.isRef())
+        LocalRaceVal |= static_cast<unsigned>(SuppressionVal::Ref);
+    }
+
     for (const Value *Obj : Objects) {
       // Ignore objects that are not involved in races.
       if (!RI.ObjectInvolvedInRace(Obj))
@@ -2250,15 +2235,25 @@ Value *CilkSanitizerImpl::Instrumentor::getSuppressionCheck(
 
       // If we find an object with no suppression, give up.
       if (!LocalSuppressions.count(Obj)) {
-        dbgs() << "No local suppression found for obj " << *Obj << "\n";
-        dbgs() << "  I: " << *I << "\n";
-        dbgs() << "  Ptr: " << *RD.Access.getPointer() << "\n";
+        LLVM_DEBUG(
+            dbgs() << "No local suppression found for obj " << *Obj << "\n"
+            << "  I: " << *I << "\n"
+            << "  Ptr: " << *RD.Access.getPointer() << "\n");
         return IRB.getFalse();
       }
 
       Value *FlagLoad = readSuppressionVal(LocalSuppressions[Obj], IRB);
-      Value *FlagCheck = IRB.CreateAnd(
-          FlagLoad, getSuppressionIRValue(IRB, RaceTypeToFlagVal(RD.Type)));
+      // If we're dealing with a local race, then don't suppress based on the
+      // race-type information from the suppression value.  For function
+      // arguments, that suppression value reflects potential races via an
+      // ancestor, which should not disable checking of local races.
+      Value *FlagCheck;
+      if (LocalRace)
+        FlagCheck = getSuppressionIRValue(
+            IRB, static_cast<unsigned>(SuppressionVal::ModRef));
+      else
+        FlagCheck = IRB.CreateAnd(
+            FlagLoad, getSuppressionIRValue(IRB, RaceTypeToFlagVal(RD.Type)));
       SuppressionChk = IRB.CreateAnd(
           SuppressionChk, IRB.CreateICmpEQ(getSuppressionIRValue(IRB, 0),
                                            FlagCheck));
@@ -2267,6 +2262,45 @@ Value *CilkSanitizerImpl::Instrumentor::getSuppressionCheck(
           getSuppressionIRValue(IRB, 0), IRB.CreateAnd(
               FlagLoad, getSuppressionIRValue(
                   IRB, static_cast<unsigned>(SuppressionVal::NoAlias))));
+
+      if (RD.Racer.isValid()) {
+        for (const Value *RObj : RacerObjects) {
+          // If the racer object matches Obj, there's no need to check a flag.
+          if (RObj == Obj) {
+            SuppressionChk = IRB.getFalse();
+            continue;
+          }
+
+          // Check if Loc and the racer object may alias.
+          if (!AA->alias(Loc, MemoryLocation(RObj)))
+              continue;
+
+          if (!LocalSuppressions.count(RObj)) {
+            LLVM_DEBUG(dbgs() << "No local suppression found for racer object "
+                       << RObj << "\n");
+            SuppressionChk = IRB.getFalse();
+            continue;
+          }
+
+          Value *FlagLoad = readSuppressionVal(LocalSuppressions[RObj], IRB);
+          Value *FlagCheck;
+          if (LocalRace)
+            FlagCheck = getSuppressionIRValue(
+                IRB, static_cast<unsigned>(SuppressionVal::ModRef));
+          else
+            FlagCheck = IRB.CreateAnd(FlagLoad, getSuppressionIRValue(
+                                          IRB, LocalRaceVal));
+          Value *RObjNoAliasFlag = IRB.CreateAnd(
+              FlagLoad, getSuppressionIRValue(
+                  IRB, static_cast<unsigned>(SuppressionVal::NoAlias)));
+          Value *RObjNoAliasCheck = IRB.CreateICmpNE(
+              getSuppressionIRValue(IRB, 0), RObjNoAliasFlag);
+          SuppressionChk = IRB.CreateAnd(
+              SuppressionChk, IRB.CreateOr(
+                  IRB.CreateOr(NoAliasCheck, RObjNoAliasCheck),
+                  IRB.CreateICmpEQ(getSuppressionIRValue(IRB, 0), FlagCheck)));
+        }
+      }
 
       // Check the function arguments that might alias this object.
       for (Argument &Arg : F->args()) {
@@ -2281,19 +2315,30 @@ Value *CilkSanitizerImpl::Instrumentor::getSuppressionCheck(
           continue;
         // If we have no local suppression information about the argument, give up.
         if (!LocalSuppressions.count(&Arg)) {
-          dbgs() << "No local suppression found for arg " << Arg << "\n";
+          LLVM_DEBUG(dbgs() << "No local suppression found for arg " << Arg
+                     << "\n");
           return IRB.getFalse();
         }
 
         // Incorporate the suppression value for this argument if we don't have
         // a dynamic no-alias bit set.
         Value *FlagLoad = readSuppressionVal(LocalSuppressions[&Arg], IRB);
-        Value *FlagCheck = IRB.CreateAnd(
-            FlagLoad, getSuppressionIRValue(IRB, RaceTypeToFlagVal(RD.Type)));
+        Value *FlagCheck;
+        if (LocalRace)
+          FlagCheck = getSuppressionIRValue(
+              IRB, static_cast<unsigned>(SuppressionVal::ModRef));
+        else
+          FlagCheck = IRB.CreateAnd(
+              FlagLoad, getSuppressionIRValue(IRB, RaceTypeToFlagVal(RD.Type)));
+        Value *ArgNoAliasFlag = IRB.CreateAnd(
+            FlagLoad, getSuppressionIRValue(
+                IRB, static_cast<unsigned>(SuppressionVal::NoAlias)));
+        Value *ArgNoAliasCheck = IRB.CreateICmpNE(
+            getSuppressionIRValue(IRB, 0), ArgNoAliasFlag);
         SuppressionChk = IRB.CreateAnd(
             SuppressionChk, IRB.CreateOr(
-                NoAliasCheck, IRB.CreateICmpEQ(getSuppressionIRValue(IRB, 0),
-                                               FlagCheck)));
+                IRB.CreateOr(NoAliasCheck, ArgNoAliasCheck),
+                IRB.CreateICmpEQ(getSuppressionIRValue(IRB, 0), FlagCheck)));
       }
     }
   }
@@ -2304,8 +2349,8 @@ bool CilkSanitizerImpl::Instrumentor::PerformDelayedInstrumentation() {
   bool Result = false;
   // Handle delayed simple instructions
   for (Instruction *I : DelayedSimpleInsts) {
-    assert(RI.mightRaceViaAncestor(I) &&
-           "Delayed instrumentation is not race via ancestor");
+    assert((RI.mightRaceViaAncestor(I) || RI.mightRaceLocally(I)) &&
+           "Delayed instrumentation is not local race or race via ancestor");
     IRBuilder<> IRB(I);
 
     Value *SupprChk = getSuppressionCheck(I, IRB);
@@ -2324,8 +2369,8 @@ bool CilkSanitizerImpl::Instrumentor::PerformDelayedInstrumentation() {
   // Handle delayed memory intrinsics
   for (auto &MemIntrinOp : DelayedMemIntrinsics) {
     Instruction *I = MemIntrinOp.first;
-    assert(RI.mightRaceViaAncestor(I) &&
-           "Delayed instrumentation is not race via ancestor");
+    assert((RI.mightRaceViaAncestor(I)  || RI.mightRaceLocally(I)) &&
+           "Delayed instrumentation is not local race or race via ancestor");
     unsigned OperandNum = MemIntrinOp.second;
     IRBuilder<> IRB(I);
 
@@ -2560,14 +2605,9 @@ bool CilkSanitizerImpl::instrumentFunctionUsingRI(Function &F) {
     // Insert suppression flags for each function argument.
     FuncI.InsertArgSuppressionFlags(F, FuncId);
 
-    // TODO: Implement these instrumentation routines.
-    //
-    // -) Ancestor races: If pointer is a function argument, then make
-    // instrumentation conditional on ModRef bit inserted for that argument.
     Result |= FuncI.InstrumentSimpleInstructions(AllLoadsAndStores);
     Result |= FuncI.InstrumentSimpleInstructions(AtomicAccesses);
     Result |= FuncI.InstrumentAnyMemIntrinsics(MemIntrinCalls);
-    // -) Set the correct ModRef bit for each pointer argument for the call.
     Result |= FuncI.InstrumentCalls(Callsites);
 
     // Instrument ancillary instructions including allocas, allocation-function

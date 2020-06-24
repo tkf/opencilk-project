@@ -25,6 +25,7 @@
 #include "llvm/Analysis/ScalarEvolutionExpander.h"
 #include "llvm/Analysis/TapirTaskInfo.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
+#include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DebugInfo.h"
@@ -124,6 +125,11 @@ static cl::opt<bool>
         "csi-assume-no-exceptions", cl::init(false), cl::Hidden,
         cl::desc("Assume that ordinary calls cannot throw exceptions."));
 
+static cl::opt<bool>
+    SplitBlocksAtCalls(
+        "csi-split-blocks-at-calls", cl::init(true), cl::Hidden,
+        cl::desc("Split basic blocks at function calls."));
+
 static size_t numPassRuns = 0;
 bool IsFirstRun() { return numPassRuns == 0; }
 
@@ -141,6 +147,7 @@ static CSIOptions OverrideFromCL(CSIOptions Options) {
   Options.InstrumentAllocas = ClInstrumentAllocas;
   Options.InstrumentAllocFns = ClInstrumentAllocFns;
   Options.CallsMayThrow = !AssumeNoExceptions;
+  Options.CallsTerminateBlocks = SplitBlocksAtCalls;
   return Options;
 }
 
@@ -274,6 +281,7 @@ bool CSIImpl::callsPlaceholderFunction(const Instruction &I) {
     case Intrinsic::syncregion_start:
     case Intrinsic::taskframe_create:
     case Intrinsic::taskframe_use:
+    case Intrinsic::taskframe_end:
     case Intrinsic::taskframe_load_guard:
       // These intrinsics don't actually represent code after lowering.
       return true;
@@ -362,18 +370,27 @@ Value *ForensicTable::localToGlobalId(uint64_t LocalId,
   return IRB.CreateAdd(Base, Offset);
 }
 
-uint64_t SizeTable::add(const BasicBlock &BB) {
+uint64_t SizeTable::add(const BasicBlock &BB, TargetTransformInfo *TTI) {
   uint64_t ID = getId(&BB);
   // Count the LLVM IR instructions
-  int32_t NonEmptyIRSize = 0;
+  int32_t IRCost = 0;
   for (const Instruction &I : BB) {
-    if (isa<PHINode>(I))
-      continue;
-    if (CSIImpl::callsPlaceholderFunction(I))
-      continue;
-    NonEmptyIRSize++;
+    if (TTI) {
+      int ICost =
+          TTI->getInstructionCost(&I, TargetTransformInfo::TCK_RecipThroughput);
+      if (-1 == ICost)
+        IRCost += static_cast<int>(TargetTransformInfo::TCC_Basic);
+      else
+        IRCost += ICost;
+    } else {
+      if (isa<PHINode>(I))
+        continue;
+      if (CSIImpl::callsPlaceholderFunction(I))
+        continue;
+      IRCost++;
+    }
   }
-  add(ID, BB.size(), NonEmptyIRSize);
+  add(ID, BB.size(), IRCost);
   return ID;
 }
 
@@ -716,9 +733,6 @@ void CSIImpl::initializeTapirHooks() {
 // call that can throw is modeled with an invoke.
 void CSIImpl::setupCalls(Function &F) {
   promoteCallsInTasksToInvokes(F, "csi.cleanup");
-
-  // TODO: Split each basic block immediately after each call, to ensure that
-  // calls act like terminators?
 }
 
 static BasicBlock *SplitOffPreds(BasicBlock *BB,
@@ -783,18 +797,6 @@ static void setupBlock(BasicBlock *BB, const TargetLibraryInfo *TLI,
 
   BasicBlock *BBToSplit = BB;
   // Split off the predecessors of each type.
-  if (!DetachPreds.empty() && NumPredTypes > 1) {
-    BBToSplit = SplitOffPreds(BBToSplit, DetachPreds, DT, LI);
-    NumPredTypes--;
-  }
-  if (!DetRethrowPreds.empty() && NumPredTypes > 1) {
-    BBToSplit = SplitOffPreds(BBToSplit, DetRethrowPreds, DT, LI);
-    NumPredTypes--;
-  }
-  if (!TFResumePreds.empty() && NumPredTypes > 1) {
-    BBToSplit = SplitOffPreds(BBToSplit, TFResumePreds, DT, LI);
-    NumPredTypes--;
-  }
   if (!SyncPreds.empty() && NumPredTypes > 1) {
     BBToSplit = SplitOffPreds(BBToSplit, SyncPreds, DT, LI);
     NumPredTypes--;
@@ -811,6 +813,24 @@ static void setupBlock(BasicBlock *BB, const TargetLibraryInfo *TLI,
     BBToSplit = SplitOffPreds(BBToSplit, InvokePreds, DT, LI);
     NumPredTypes--;
   }
+  if (!TFResumePreds.empty() && NumPredTypes > 1) {
+    BBToSplit = SplitOffPreds(BBToSplit, TFResumePreds, DT, LI);
+    NumPredTypes--;
+  }
+  // We handle detach and detached.rethrow predecessors at the end to preserve
+  // invariants on the CFG structure about the deadness of basic blocks after
+  // detached-rethrows.
+  if (!DetachPreds.empty() && NumPredTypes > 1) {
+    BBToSplit = SplitOffPreds(BBToSplit, DetachPreds, DT, LI);
+    NumPredTypes--;
+  }
+  // There is no need to split off detached-rethrow predecessors, since those
+  // successors of a detached-rethrow are dead up to where control flow merges
+  // with the unwind destination of a detach.
+  // if (!DetRethrowPreds.empty() && NumPredTypes > 1) {
+  //   BBToSplit = SplitOffPreds(BBToSplit, DetRethrowPreds, DT, LI);
+  //   NumPredTypes--;
+  // }
 }
 
 // Setup all basic blocks such that each block's predecessors belong entirely to
@@ -830,6 +850,26 @@ void CSIImpl::setupBlocks(Function &F, const TargetLibraryInfo *TLI,
 
   for (BasicBlock *BB : BlocksToSetup)
     setupBlock(BB, TLI, DT, LI);
+}
+
+// Split basic blocks so that ordinary call instructions terminate basic blocks.
+void CSIImpl::splitBlocksAtCalls(Function &F, DominatorTree *DT, LoopInfo *LI) {
+  // Split basic blocks after call instructions.
+  SmallVector<Instruction *, 32> CallsToSplit;
+  for (BasicBlock &BB : F)
+    for (Instruction &I : BB)
+      if (isa<CallInst>(I) &&
+          // Skip placeholder call instructions
+          !callsPlaceholderFunction(I) &&
+          // Skip a call instruction if it is immediately followed by a
+          // terminator
+          !I.getNextNode()->isTerminator() &&
+          // If the call does not return, don't bother splitting
+          !cast<CallInst>(&I)->doesNotReturn())
+        CallsToSplit.push_back(&I);
+
+  for (Instruction *Call : CallsToSplit)
+    SplitBlock(Call->getParent(), Call->getNextNode(), DT, LI);
 }
 
 int CSIImpl::getNumBytesAccessed(Value *Addr, const DataLayout &DL) {
@@ -932,7 +972,8 @@ bool CSIImpl::instrumentMemIntrinsic(Instruction *I) {
 void CSIImpl::instrumentBasicBlock(BasicBlock &BB) {
   IRBuilder<> IRB(&*BB.getFirstInsertionPt());
   uint64_t LocalId = BasicBlockFED.add(BB);
-  uint64_t BBSizeId = BBSize.add(BB);
+  uint64_t BBSizeId = BBSize.add(BB, GetTTI ?
+                                 &(*GetTTI)(*BB.getParent()) : nullptr);
   assert(LocalId == BBSizeId &&
          "BB recieved different ID's in FED and sizeinfo tables.");
   Value *CsiId = BasicBlockFED.localToGlobalId(LocalId, IRB);
@@ -2216,9 +2257,17 @@ void CSIImpl::instrumentFunction(Function &F) {
     return;
 
   if (Options.CallsMayThrow)
+    // Promote calls to invokes to insert CSI instrumentation in
+    // exception-handling code.
     setupCalls(F);
 
+  // Canonicalize the CFG for CSI instrumentation
   setupBlocks(F, TLI);
+
+  // If we do not assume that calls terminate blocks, or if we're not
+  // instrumenting basic blocks, then we're done.
+  if (Options.InstrumentBasicBlocks && Options.CallsTerminateBlocks)
+    splitBlocksAtCalls(F);
 
   DominatorTree *DT = &GetDomTree(F);
   LoopInfo &LI = GetLoopInfo(F);
@@ -2443,6 +2492,7 @@ void ComprehensiveStaticInstrumentationLegacyPass::getAnalysisUsage(
   AU.addRequired<ScalarEvolutionWrapperPass>();
   AU.addRequired<TaskInfoWrapperPass>();
   AU.addRequired<TargetLibraryInfoWrapperPass>();
+  AU.addRequired<TargetTransformInfoWrapperPass>();
 }
 
 bool ComprehensiveStaticInstrumentationLegacyPass::runOnModule(Module &M) {
@@ -2458,6 +2508,9 @@ bool ComprehensiveStaticInstrumentationLegacyPass::runOnModule(Module &M) {
   auto GetLoopInfo = [this](Function &F) -> LoopInfo & {
     return this->getAnalysis<LoopInfoWrapperPass>(F).getLoopInfo();
   };
+  auto GetTTI = [this](Function &F) -> TargetTransformInfo & {
+    return this->getAnalysis<TargetTransformInfoWrapperPass>().getTTI(F);
+  };
   auto GetSE = [this](Function &F) -> ScalarEvolution & {
     return this->getAnalysis<ScalarEvolutionWrapperPass>(F).getSE();
   };
@@ -2466,7 +2519,7 @@ bool ComprehensiveStaticInstrumentationLegacyPass::runOnModule(Module &M) {
   };
 
   bool res = CSIImpl(M, CG, GetDomTree, GetLoopInfo, GetTaskInfo, TLI, GetSE,
-                     Options).run();
+                     GetTTI, Options).run();
 
   verifyModule(M, &llvm::errs());
 
@@ -2491,6 +2544,9 @@ ComprehensiveStaticInstrumentationPass::run(Module &M,
   auto GetLI = [&FAM](Function &F) -> LoopInfo & {
     return FAM.getResult<LoopAnalysis>(F);
   };
+  auto GetTTI = [&FAM](Function &F) -> TargetTransformInfo & {
+    return FAM.getResult<TargetIRAnalysis>(F);
+  };
   auto GetSE = [&FAM](Function &F) -> ScalarEvolution & {
     return FAM.getResult<ScalarEvolutionAnalysis>(F);
   };
@@ -2499,7 +2555,7 @@ ComprehensiveStaticInstrumentationPass::run(Module &M,
   };
   auto *TLI = &AM.getResult<TargetLibraryAnalysis>(M);
 
-  if (!CSIImpl(M, &CG, GetDT, GetLI, GetTI, TLI, GetSE, Options).run())
+  if (!CSIImpl(M, &CG, GetDT, GetLI, GetTI, TLI, GetSE, GetTTI, Options).run())
     return PreservedAnalyses::all();
 
   return PreservedAnalyses::none();

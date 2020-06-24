@@ -83,6 +83,38 @@ bool llvm::isSyncUnwind(const Instruction *I, const Value *SyncRegion) {
   return isTapirIntrinsic(Intrinsic::sync_unwind, I, SyncRegion);
 }
 
+/// Returns true if BasicBlock \p B is a placeholder successor, that is, it's
+/// the immediate successor of only detached-rethrow and taskframe-resume
+/// instructions.
+bool llvm::isPlaceholderSuccessor(const BasicBlock *B) {
+  for (const BasicBlock *Pred : predecessors(B)) {
+    if (!isDetachedRethrow(Pred->getTerminator()) &&
+        !isTaskFrameResume(Pred->getTerminator()))
+      return false;
+    if (B == cast<InvokeInst>(
+            Pred->getTerminator())->getUnwindDest())
+      return false;
+  }
+  return true;
+}
+
+/// Returns true if the given basic block ends a taskframe, false otherwise.  If
+/// \p TaskFrame is specified, then additionally checks that the
+/// taskframe.end uses \p TaskFrame.
+bool llvm::endsTaskFrame(const BasicBlock *B, const Value *TaskFrame) {
+  const Instruction *I = B->getTerminator()->getPrevNode();
+  return I && isTapirIntrinsic(Intrinsic::taskframe_end, I, TaskFrame);
+}
+
+/// Returns the spindle containing the taskframe.create used by task \p T, or
+/// the entry spindle of \p T if \p T has no such taskframe.create spindle.
+Spindle *llvm::getTaskFrameForTask(Task *T) {
+  Spindle *TF = T->getTaskFrameCreateSpindle();
+  if (!TF)
+    TF = T->getEntrySpindle();
+  return TF;
+}
+
 // Removes the given sync.unwind instruction, if it is dead.  Returns true if
 // the sync.unwind was removed, false otherwise.
 bool llvm::removeDeadSyncUnwind(CallBase *SyncUnwind) {
@@ -426,6 +458,17 @@ BasicBlock *LandingPadInliningInfo::getInnerResumeDest() {
   return InnerResumeDest;
 }
 
+// Helper method to remove Pred from the PHI nodes of BB, if Pred is present in
+// those PHI nodes.  Unlike BasicBlock::removePredecessor, this method does not
+// error if Pred is not found in a PHI node of BB.
+static void maybeRemovePredecessor(BasicBlock *BB, BasicBlock *Pred) {
+  for (PHINode &PN : BB->phis()) {
+    int BBIdx = PN.getBasicBlockIndex(Pred);
+    if (-1 != BBIdx)
+      PN.removeIncomingValue(BBIdx);
+  }
+}
+
 /// Forward a task resume - a terminator, such as a detached.rethrow or
 /// taskframe.resume, marking the exit from a task for exception handling - to
 /// the spawner's landing pad block.  When the landing pad block has only one
@@ -465,17 +508,24 @@ void LandingPadInliningInfo::forwardTaskResume(InvokeInst *TR) {
 
   // Remove the TR
   if (!NormalDest)
-    for (PHINode &PN : TR->getNormalDest()->phis())
-      PN.removeIncomingValue(Src);
+    TR->getNormalDest()->removePredecessor(Src);
   if (!UnwindDest)
-    for (PHINode &PN : TR->getUnwindDest()->phis())
-      PN.removeIncomingValue(Src);
+    TR->getUnwindDest()->removePredecessor(Src);
 
   TR->eraseFromParent();
-  if (NormalDest)
+
+  if (NormalDest) {
+    for (BasicBlock *Succ : successors(NormalDest)) {
+      maybeRemovePredecessor(Succ, NormalDest);
+    }
     NormalDest->eraseFromParent();
-  if (UnwindDest)
+  }
+  if (UnwindDest) {
+    for (BasicBlock *Succ : successors(UnwindDest)) {
+      maybeRemovePredecessor(Succ, UnwindDest);
+    }
     UnwindDest->eraseFromParent();
+  }
 }
 
 static void handleDetachedLandingPads(
@@ -657,7 +707,7 @@ static void handleTaskFrameResume(Value *TaskFrame,
   getTaskFrameLandingPads(TaskFrame, TaskFrameResume, InlinedLPads);
 
   InvokeInst *TFR = cast<InvokeInst>(TaskFrameResume);
-  LandingPadInliningInfo TFResumeDest(TFR);
+  LandingPadInliningInfo TFResumeDest(TFR, DT);
 
   // Append the clauses from the outer landing pad instruction into the inlined
   // landing pad instructions.
@@ -699,6 +749,7 @@ void llvm::SerializeDetach(DetachInst *DI, BasicBlock *ParentEntry,
   BasicBlock *Spawner = DI->getParent();
   BasicBlock *TaskEntry = DI->getDetached();
   BasicBlock *Continue = DI->getContinue();
+  BasicBlock *Unwind = DI->getUnwindDest();
   Value *SyncRegion = DI->getSyncRegion();
 
   // If the spawned task has a taskframe, serialize the taskframe.
@@ -773,9 +824,12 @@ void llvm::SerializeDetach(DetachInst *DI, BasicBlock *ParentEntry,
   ReplaceInstWithInst(DI, BranchInst::Create(TaskEntry));
 
   // Update dominator tree.
-  if (DT)
+  if (DT) {
     if (DT->dominates(Spawner, Continue))
       DT->changeImmediateDominator(Continue, ReattachDom);
+    if (DI->hasUnwindDest())
+      DT->deleteEdge(Spawner, Unwind);
+  }
 }
 
 /// Analyze a task for serialization
@@ -793,6 +847,9 @@ void llvm::AnalyzeTaskForSerialization(
     for (BasicBlock *BB : S->blocks()) {
       // Record any shared-EH blocks that need to be cloned.
       if (S->isSharedEH()) {
+	// Skip basic blocks that are placeholder successors
+	if (isPlaceholderSuccessor(BB))
+	  continue;
         EHBlocksToClone.push_back(BB);
         if (S->getEntry() == BB)
           for (BasicBlock *Pred : predecessors(BB))
@@ -930,9 +987,74 @@ BranchInst *llvm::SerializeDetachedCFG(DetachInst *DI, DominatorTree *DT) {
   return ReplacementBr;
 }
 
+static bool isCanonicalTaskFrameEnd(const Instruction *TFEnd) {
+  // Check that the last instruction in the basic block containing TFEnd is
+  // TFEnd.
+  const Instruction *Term = &TFEnd->getParent()->back();
+  if (!Term || isa<SyncInst>(Term) || isa<ReattachInst>(Term))
+    return false;
+
+  const Instruction *Prev = Term->getPrevNode();
+  if (!Prev || Prev != TFEnd)
+    return false;
+
+  return true;
+}
+
+// Check if the basic block terminates a taskframe via a taskframe.end.
+static bool endsUnassociatedTaskFrame(const BasicBlock *B) {
+  const Instruction *Prev = B->getTerminator()->getPrevNode();
+  if (!Prev)
+    return false;
+  if (isTapirIntrinsic(Intrinsic::taskframe_end, Prev) &&
+      isCanonicalTaskFrameEnd(Prev))
+    return true;
+  return false;
+}
+
+/// Checks if the given taskframe.create instruction is in canonical form.  This
+/// function mirrors the behavior of needToSplitTaskFrameCreate in
+/// Transforms/Utils/TapirUtils.
+static bool isCanonicalTaskFrameCreate(const Instruction *TFCreate) {
+  // If the taskframe.create is not the first instruction, split.
+  if (TFCreate != &TFCreate->getParent()->front())
+    return false;
+
+  // The taskframe.create is at the front of the block.  Check that we have a
+  // single predecessor.
+  const BasicBlock *Pred = TFCreate->getParent()->getSinglePredecessor();
+  if (!Pred)
+    return false;
+
+  // Check that the single predecessor has a single successor.
+  if (!Pred->getSingleSuccessor())
+    return false;
+
+  // Check whether the single predecessor is terminated with a sync.
+  if (isa<SyncInst>(Pred->getTerminator()))
+    return false;
+
+  // If the taskframe.create has no users, ignore it.
+  if (TFCreate->user_empty())
+    return false;
+
+  // Check that the uses of the taskframe.create are canonical as well.
+  for (const User *U : TFCreate->users()) {
+    if (const Instruction *I = dyn_cast<Instruction>(U)) {
+      if (isTapirIntrinsic(Intrinsic::taskframe_use, I) ||
+          isTapirIntrinsic(Intrinsic::taskframe_resume, I))
+        return true;
+      if (isTapirIntrinsic(Intrinsic::taskframe_end, I))
+        return isCanonicalTaskFrameEnd(I);
+    }
+  }
+  return true;
+}
+
 static const Value *getCanonicalTaskFrameCreate(const BasicBlock *BB) {
   if (const IntrinsicInst *II = dyn_cast<IntrinsicInst>(&BB->front()))
-    if (Intrinsic::taskframe_create == II->getIntrinsicID())
+    if (Intrinsic::taskframe_create == II->getIntrinsicID() &&
+        isCanonicalTaskFrameCreate(II))
       return II;
   return nullptr;
 }
@@ -963,10 +1085,7 @@ const BasicBlock *llvm::GetDetachedCtx(const BasicBlock *BB) {
       if (!TaskFramesToIgnore.count(TaskFrame))
         return CurrBB;
 
-    for (auto PI = pred_begin(CurrBB), PE = pred_end(CurrBB);
-         PI != PE; ++PI) {
-      const BasicBlock *PredBB = *PI;
-
+    for (const BasicBlock *PredBB : predecessors(CurrBB)) {
       // Skip predecessors via reattach instructions.  The detacher block
       // corresponding to this reattach is also a predecessor of the current
       // basic block.
@@ -982,10 +1101,14 @@ const BasicBlock *llvm::GetDetachedCtx(const BasicBlock *BB) {
       if (isTaskFrameResume(PredBB->getTerminator())) {
         const InvokeInst *II = cast<InvokeInst>(PredBB->getTerminator());
         TaskFramesToIgnore.insert(II->getArgOperand(0));
+      } else if (endsUnassociatedTaskFrame(PredBB)) {
+        const CallBase *TFEnd = cast<CallBase>(
+            PredBB->getTerminator()->getPrevNode());
+        TaskFramesToIgnore.insert(TFEnd->getArgOperand(0));
       }
 
       // If the predecessor is terminated by a detach, check to see if
-      // that detach detached the current basic block.
+      // that detach spawned the current basic block.
       if (isa<DetachInst>(PredBB->getTerminator())) {
         const DetachInst *DI = cast<DetachInst>(PredBB->getTerminator());
         if (DI->getDetached() == CurrBB)
@@ -1006,6 +1129,68 @@ const BasicBlock *llvm::GetDetachedCtx(const BasicBlock *BB) {
   // Our search didn't find anything, so return the entry of the function
   // containing the given block.
   return &(BB->getParent()->getEntryBlock());
+}
+
+// Returns true if the function may not be synced at the point of the given
+// basic block, false otherwise.  This function does a simple depth-first
+// traversal of the CFG, and as such, produces a conservative result.
+bool llvm::mayBeUnsynced(const BasicBlock *BB) {
+  SmallPtrSet<const BasicBlock *, 32> Visited;
+  SmallVector<const BasicBlock *, 32> WorkList;
+  SmallPtrSet<const Value *, 2> TaskFramesToIgnore;
+  WorkList.push_back(BB);
+  while (!WorkList.empty()) {
+    const BasicBlock *CurrBB = WorkList.pop_back_val();
+    if (!Visited.insert(CurrBB).second)
+      continue;
+
+    // If we find a canonical taskframe.create that we're not ignoring, then
+    // we've found the context.
+    if (const Value *TaskFrame = getCanonicalTaskFrameCreate(CurrBB))
+      if (!TaskFramesToIgnore.count(TaskFrame))
+        continue;
+
+    for (const BasicBlock *PredBB : predecessors(CurrBB)) {
+      // If we find a predecessor via reattach instructions, then
+      // wconservatively return that we may not be synced.
+      if (isa<ReattachInst>(PredBB->getTerminator()))
+          return true;
+
+      // If we find a predecessor via a detached.rethrow, then conservatively
+      // return that we may not be synced.
+      if (isDetachedRethrow(PredBB->getTerminator()))
+        return true;
+
+      // If we find a taskframe.resume, add its taskframe to the set of
+      // taskframes to ignore.
+      if (isTaskFrameResume(PredBB->getTerminator())) {
+        const InvokeInst *II = cast<InvokeInst>(PredBB->getTerminator());
+        TaskFramesToIgnore.insert(II->getArgOperand(0));
+      } else if (endsUnassociatedTaskFrame(PredBB)) {
+        const CallBase *TFEnd = cast<CallBase>(
+            PredBB->getTerminator()->getPrevNode());
+        TaskFramesToIgnore.insert(TFEnd->getArgOperand(0));
+      }
+
+      // If the predecessor is terminated by a detach, check to see if
+      // that detach spawned the current basic block.
+      if (isa<DetachInst>(PredBB->getTerminator())) {
+        const DetachInst *DI = cast<DetachInst>(PredBB->getTerminator());
+        if (DI->getDetached() == CurrBB)
+          // Return the current block, which is the entry of this detached
+          // sub-CFG.
+          continue;
+        else
+          // We encountered a continue or unwind destination of a detach.
+          // Conservatively return that we may not be synced.
+          return true;
+      }
+
+      // Otherwise, add the predecessor block to the work list to search.
+      WorkList.push_back(PredBB);
+    }
+  }
+  return false;
 }
 
 /// isCriticalContinueEdge - Return true if the specified edge is a critical
@@ -1240,14 +1425,14 @@ Value *llvm::getTaskFrameUsed(BasicBlock *Detached) {
 // Helper function to check if the given taskframe.create instruction requires
 // the parent basic block to be split in order to canonicalize the
 // representation of taskframes.
-static bool needToSplitTaskFrameCreate(Instruction *TFCreate) {
+static bool needToSplitTaskFrameCreate(const Instruction *TFCreate) {
   // If the taskframe.create is not the first instruction, split.
   if (TFCreate != &TFCreate->getParent()->front())
     return true;
 
   // The taskframe.create is at the front of the block.  Check that we have a
   // single predecessor.
-  BasicBlock *Pred = TFCreate->getParent()->getSinglePredecessor();
+  const BasicBlock *Pred = TFCreate->getParent()->getSinglePredecessor();
   if (!Pred)
     return true;
 
@@ -1262,15 +1447,47 @@ static bool needToSplitTaskFrameCreate(Instruction *TFCreate) {
   return false;
 }
 
+// Helper function to check if the given taskframe.end instruction requires the
+// parent basic block to be split in order to canonicalize the representation of
+// taskframes.
+static bool needToSplitTaskFrameEnd(const Instruction *TFEnd) {
+  const BasicBlock *B = TFEnd->getParent();
+  // If the taskframe.end is not the penultimate instruction, split.
+  if (TFEnd != B->getTerminator()->getPrevNode())
+    return true;
+
+  // Check whether the parent block has a single successor.
+  const BasicBlock *Succ = B->getSingleSuccessor();
+  if (!Succ)
+    return true;
+
+  // Check that the single successor has a single predecessor.
+  if (!Succ->getSinglePredecessor())
+    return true;
+
+  // Check that the single successor is not a taskframe.create entry.
+  if (isTapirIntrinsic(Intrinsic::taskframe_create, &Succ->front()))
+    return true;
+
+  // Check whether the parent block is terminated with a sync or a reattach.
+  if (isa<SyncInst>(B->getTerminator()) ||
+      isa<ReattachInst>(B->getTerminator()))
+    return true;
+
+  return false;
+}
+
 /// Split blocks in function F containing taskframe.create calls to canonicalize
 /// the representation of Tapir taskframes in F.
 bool llvm::splitTaskFrameCreateBlocks(Function &F, DominatorTree *DT,
                                       TaskInfo *TI) {
-  if (F.empty())
+  if (F.empty() || (TI && TI->isSerial()))
     return false;
 
   // Scan the function for taskframe.create instructions to split.
   SmallVector<Instruction *, 32> TFCreateToSplit;
+  SmallVector<DetachInst *, 8> DetachesWithTaskFrames;
+  SmallVector<Instruction *, 8> TFEndToSplit;
   SmallVector<BasicBlock *, 8> WorkList;
   SmallPtrSet<BasicBlock *, 32> Visited;
   WorkList.push_back(&F.getEntryBlock());
@@ -1279,20 +1496,34 @@ bool llvm::splitTaskFrameCreateBlocks(Function &F, DominatorTree *DT,
     if (!Visited.insert(BB).second)
       continue;
 
-    // We can find taskframe.create instructions to split by examining the
-    // arguments of taskframe.use instructions in detached blocks.
-    if (DetachInst *DI = dyn_cast<DetachInst>(BB->getTerminator())) {
-      // Scan the instructions in the detached block for a taskframe.use.
-      for (const Instruction &I : *DI->getDetached()) {
-        if (const CallBase *Call = dyn_cast<CallBase>(&I))
-          if (const Function *Called = Call->getCalledFunction())
-            if (Intrinsic::taskframe_use == Called->getIntrinsicID()) {
-              TFCreateToSplit.push_back(
-                  cast<Instruction>(Call->getArgOperand(0)));
-              LLVM_DEBUG(dbgs() << "Pushing TFCreate "
-                         << *Call->getArgOperand(0) << "\n");
-              break;
+    // Scan the instructions in BB for taskframe.create intrinsics.
+    for (Instruction &I : *BB) {
+      if (IntrinsicInst *II = dyn_cast<IntrinsicInst>(&I)) {
+        if (Intrinsic::taskframe_create == II->getIntrinsicID()) {
+          // Record this taskframe.create for splitting.
+          LLVM_DEBUG(dbgs() << "Pushing TFCreate " << *II << "\n");
+          TFCreateToSplit.push_back(II);
+
+          // Look for a detach instructions and taskframe.end intrinsics that
+          // use this taskframe.
+          for (User *U : II->users()) {
+            if (IntrinsicInst *UI = dyn_cast<IntrinsicInst>(U)) {
+              if (Intrinsic::taskframe_use == UI->getIntrinsicID()) {
+                if (BasicBlock *Pred = UI->getParent()->getSinglePredecessor())
+                  if (DetachInst *DI =
+                      dyn_cast<DetachInst>(Pred->getTerminator())) {
+                    // Record this detach as using a taskframe.
+                    DetachesWithTaskFrames.push_back(DI);
+                    break;
+                  }
+              } else if (Intrinsic::taskframe_end == UI->getIntrinsicID()) {
+                // Record this taskframe.end.
+                TFEndToSplit.push_back(UI);
+                break;
+              }
             }
+          }
+        }
       }
     }
 
@@ -1307,9 +1538,37 @@ bool llvm::splitTaskFrameCreateBlocks(Function &F, DominatorTree *DT,
   for (Instruction *I : TFCreateToSplit)
     if (needToSplitTaskFrameCreate(I)) {
       LLVM_DEBUG(dbgs() << "Splitting at " << *I << "\n");
+      StringRef OldName = I->getParent()->getName();
       SplitBlock(I->getParent(), I, DT);
+      I->getParent()->setName(OldName+".tf");
       Changed = true;
     }
+
+  // Split basic blocks containing taskframe.end calls, so that they end with an
+  // unconditional branch immediately after the taskframe.end call.
+  for (Instruction *TFEnd : TFEndToSplit)
+    if (needToSplitTaskFrameEnd(TFEnd)) {
+      LLVM_DEBUG(dbgs() << "Splitting block after " << *TFEnd << "\n");
+      BasicBlock::iterator Iter = ++TFEnd->getIterator();
+      SplitBlock(TFEnd->getParent(), &*Iter, DT);
+      Iter->getParent()->setName(TFEnd->getParent()->getName()+".tfend");
+      Changed = true;
+    }
+
+  // Also split critical continue edges, if we need to.  For example, we need to
+  // split critical continue edges if we're planning to fixup external uses of
+  // variables defined in a taskframe.
+  //
+  // TODO: Predicate this canonicalization on something more intuitive than the
+  // existence of DT.
+  for (DetachInst *DI : DetachesWithTaskFrames) {
+    if (DT && isCriticalContinueEdge(DI, 1)) {
+      SplitCriticalEdge(
+          DI, 1,
+          CriticalEdgeSplittingOptions(DT, nullptr).setSplitDetachContinue());
+      Changed = true;
+    }
+  }
 
   // Recalculate TaskInfo if necessary.
   if (Changed && DT && TI)
@@ -1365,6 +1624,10 @@ void llvm::fixupTaskFrameExternalUses(Spindle *TF, const TaskInfo &TI,
 
   LLVM_DEBUG(dbgs() << "fixupTaskFrameExternalUses: spindle@"
              << TF->getEntry()->getName() << "\n");
+  LLVM_DEBUG({
+      if (T)
+        dbgs() << "  used by task@" << T->getEntry()->getName() << "\n";
+    });
 
   // Get the set of basic blocks in the taskframe spindles.  At the same time,
   // find the continuation of corresponding taskframe.resume intrinsics.
@@ -1373,7 +1636,7 @@ void llvm::fixupTaskFrameExternalUses(Spindle *TF, const TaskInfo &TI,
   BasicBlock *TFResumeContin = nullptr;
   for (Spindle *S : TF->taskframe_spindles()) {
     // Skip taskframe spindles within the task itself.
-    if (T->contains(S))
+    if (T && T->contains(S))
       continue;
     for (BasicBlock *BB : S->blocks()) {
       BlocksToCheck.insert(BB);
@@ -1387,9 +1650,10 @@ void llvm::fixupTaskFrameExternalUses(Spindle *TF, const TaskInfo &TI,
     }
   }
 
-  BasicBlock *Continuation = T->getContinuationSpindle()->getEntry();
+  BasicBlock *Continuation = TF->getTaskFrameContinuation();
 
   MapVector<Instruction *, SmallVector<Use *, 16>> ToRewrite;
+  MapVector<Value *, SmallVector<Instruction *, 8>> SyncRegionsToLocalize;
   // Find instructions in the taskframe that are used outside of the taskframe.
   for (BasicBlock *BB : BlocksToCheck) {
     for (Instruction &I : *BB) {
@@ -1412,9 +1676,64 @@ void llvm::fixupTaskFrameExternalUses(Spindle *TF, const TaskInfo &TI,
         }
       }
     }
+    // Collect any syncregions used in this taskframe that are defined outside.
+    if (!T) {
+      if (DetachInst *DI = dyn_cast<DetachInst>(BB->getTerminator()))
+        if (!taskFrameContains(
+                TF, cast<Instruction>(DI->getSyncRegion())->getParent(), TI)) {
+          LLVM_DEBUG(dbgs() << "  Sync region to localize: "
+                     << *DI->getSyncRegion() << "(user " << *DI << ")\n");
+          // Only record the detach.  We can find associated reattaches and
+          // detached-rethrows later.
+          SyncRegionsToLocalize[DI->getSyncRegion()].push_back(DI);
+        }
+
+      if (SyncInst *SI = dyn_cast<SyncInst>(BB->getTerminator()))
+        if (!taskFrameContains(
+                TF, cast<Instruction>(SI->getSyncRegion())->getParent(), TI)) {
+          LLVM_DEBUG(dbgs() << "  Sync region to localize: "
+                     << *SI->getSyncRegion() << "(user " << *SI << ")\n");
+          SyncRegionsToLocalize[SI->getSyncRegion()].push_back(SI);
+        }
+    }
   }
 
   Module *M = TF->getEntry()->getModule();
+
+  // Localize any syncregions used in this taskframe.
+  for (auto &SRUsed : SyncRegionsToLocalize) {
+    Value *ReplSR = CallInst::Create(
+        Intrinsic::getDeclaration(M, Intrinsic::syncregion_start),
+        SRUsed.first->getName(), cast<Instruction>(TaskFrame)->getNextNode());
+    for (Instruction *UseToRewrite : SRUsed.second) {
+      // Replace the syncregion of each sync.
+      if (SyncInst *SI = dyn_cast<SyncInst>(UseToRewrite)) {
+        SI->setSyncRegion(ReplSR);
+        // Replace the syncregion of each sync.unwind.
+        if (CallBase *CB = dyn_cast<CallBase>(
+                SI->getSuccessor(0)->getFirstNonPHIOrDbgOrLifetime()))
+          if (isSyncUnwind(CB, SRUsed.first))
+            CB->setArgOperand(0, ReplSR);
+      } else if (DetachInst *DI = dyn_cast<DetachInst>(UseToRewrite)) {
+        // Replace the syncregion of each detach.
+        DI->setSyncRegion(ReplSR);
+        Task *SubT = TI.getTaskFor(DI->getDetached());
+        // Replace the syncregion of corresponding reattach instructions.
+        for (BasicBlock *Pred : predecessors(DI->getContinue()))
+          if (ReattachInst *RI = dyn_cast<ReattachInst>(Pred->getTerminator()))
+            if (SubT->encloses(Pred))
+              RI->setSyncRegion(ReplSR);
+
+        // Replace the syncregion of corresponding detached.rethrows.
+        for (User *U : SRUsed.first->users())
+          if (InvokeInst *II = dyn_cast<InvokeInst>(U))
+            if (isDetachedRethrow(II) && SubT->encloses(II->getParent()))
+              II->setArgOperand(0, ReplSR);
+      }
+    }
+  }
+
+  // Rewrite any uses of values defined in the taskframe that are used outside.
   for (auto &TFInstr : ToRewrite) {
     LLVM_DEBUG(dbgs() << "Fixing taskframe output " << *TFInstr.first << "\n");
     // Create an allocation to store the result of the instruction.
@@ -1599,6 +1918,14 @@ static void PromoteCallsInTasksHelper(
         isDetachedRethrow(BB->getTerminator()))
       continue;
 
+    // If we find a taskframe.end, add its successor to the parent search.
+    if (endsTaskFrame(BB, CurrentTaskFrame)) {
+      assert(ParentWorklist &&
+             "Unexpected taskframe.resume: no parent worklist");
+      ParentWorklist->push_back(BB->getSingleSuccessor());
+      continue;
+    }
+
     // If we find a taskframe.resume terminator, add its successor to the
     // parent search.
     if (isTaskFrameResume(BB->getTerminator())) {
@@ -1712,6 +2039,22 @@ void llvm::promoteCallsInTasksToInvokes(Function &F, const Twine Name) {
   } else {
     UnreachableBlk->eraseFromParent();
   }
+}
+
+void llvm::eraseTaskFrame(Value *TaskFrame, DominatorTree *DT) {
+  InlineTaskFrameResumes(TaskFrame, DT);
+  SmallVector<Instruction *, 2> ToErase;
+  for (User *U : TaskFrame->users()) {
+    if (Instruction *UI = dyn_cast<Instruction>(U))
+      if (isTapirIntrinsic(Intrinsic::taskframe_use, UI) ||
+          isTapirIntrinsic(Intrinsic::taskframe_end, UI))
+        ToErase.push_back(UI);
+  }
+
+  for (Instruction *I : ToErase)
+    I->eraseFromParent();
+
+  cast<Instruction>(TaskFrame)->eraseFromParent();
 }
 
 /// Find hints specified in the loop metadata and update local values.
