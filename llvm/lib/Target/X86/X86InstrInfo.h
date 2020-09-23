@@ -480,6 +480,12 @@ public:
                             unsigned SrcReg2, int CmpMask, int CmpValue,
                             const MachineRegisterInfo *MRI) const override;
 
+  bool isZeroTest(MachineBasicBlock &MBB, Register &Reg, bool &Dead,
+                  MachineBasicBlock *&Zero,
+                  MachineBasicBlock *&Nonzero) const override;
+  bool setsRegister(MachineBasicBlock &MBB, Register Reg,
+                    bool Delete, int64_t &Value) const override;
+
   /// optimizeLoadInstr - Try to remove the load by folding it to a register
   /// operand at the use. We fold the load instructions if and only if the
   /// def and use are in the same BB. We only look at one load and see

@@ -1409,6 +1409,24 @@ public:
   }
   virtual bool optimizeCondBranch(MachineInstr &MI) const { return false; }
 
+  /// If this block is nothing but a compare and branch if zero or nonzero,
+  /// return the register tested and the targets based on the value of the
+  /// register.  This is called after register allocation.
+  virtual bool isZeroTest(MachineBasicBlock &MBB, Register &Reg, bool &Dead,
+                          MachineBasicBlock *&Zero,
+                          MachineBasicBlock *&Nonzero) const {
+    return false;
+  }
+
+  /// If this block always set the register to a constant, return true
+  /// and store the contsant in Value.  If Delete is true delete the
+  /// setting instruction.
+  /// This is called after register allocation.
+  virtual bool setsRegister(MachineBasicBlock &MBB, Register Reg,
+                            bool Delete, int64_t &Value) const {
+    return false;
+  }
+
   /// Try to remove the load by folding it to a register operand at the use.
   /// We fold the load instructions if and only if the
   /// def and use are in the same BB. We only look at one load and see

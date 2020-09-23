@@ -3824,6 +3824,106 @@ bool X86InstrInfo::optimizeCompareInstr(MachineInstr &CmpInstr, unsigned SrcReg,
   return true;
 }
 
+bool X86InstrInfo::isZeroTest(MachineBasicBlock &MBB, Register &Reg,
+                              bool &Dead, MachineBasicBlock *&Zero,
+                              MachineBasicBlock *&Nonzero) const {
+  SmallVector<MachineOperand, 2> Cond;
+  bool SawUnconditional = false, SawConditional = false;
+  MachineBasicBlock *TBB = 0, *FBB = 0;
+
+  if (analyzeBranch(MBB, TBB, FBB, Cond, true) || Cond.size() != 1)
+    return false;
+
+  switch (Cond[0].getImm()) {
+  case X86::COND_E:
+    Nonzero = FBB;
+    Zero = TBB;
+    break;
+  case X86::COND_NE:
+    Nonzero = TBB;
+    Zero = FBB;
+    break;
+  default:
+    return false;
+  }
+  for (MachineInstr &MI : llvm::reverse(MBB)) {
+    if (MI.isUnconditionalBranch()) {
+      if (SawUnconditional || SawConditional)
+        return false;
+      SawUnconditional = true;
+      continue;
+    }
+    if (MI.isConditionalBranch()) {
+      /* TODO: In theory if EFLAGS is not dead the branch could still
+         be made unconditional. */
+      if (SawConditional || !MI.killsRegister(X86::EFLAGS))
+        return false;
+      SawConditional = true;
+      continue;
+    }
+    if (!SawConditional)
+      return false;
+    /* There can be at most one conditional and one unconditional
+       branch for this to work. */
+    if (MI.isTerminator() || MI.isBranch())
+      return false;
+    if (MI.getOpcode() == X86::TEST32rr) {
+      /* TODO: Check for subregs? */
+      const MachineOperand &op = MI.getOperand(0);
+      if (op.getReg() == MI.getOperand(1).getReg()) {
+        Dead = op.isKill();
+        Reg = op.getReg();
+        return true;
+      }
+    }
+    return false;
+  }
+  return false;
+}
+
+bool X86InstrInfo::setsRegister(MachineBasicBlock &MBB, Register Reg,
+                                bool Delete, int64_t &Value) const {
+  const X86RegisterInfo *TRI = &getRegisterInfo();
+  for (MachineInstr &MI : llvm::reverse(MBB)) {
+    if (!MI.modifiesRegister(Reg, TRI)) {
+      continue;
+    }
+    switch (MI.getOpcode()) {
+    case X86::MOV32r0:
+      if (MI.getOperand(0).getReg() == Reg) {
+        Value = 0;
+        break;
+      }
+      return false;
+    case X86::MOV32r1:
+      if (MI.getOperand(0).getReg() == Reg) {
+        Value = 1;
+        break;
+      }
+      return false;
+    case X86::XOR32rr:
+      if (MI.getOperand(0).getReg() == Reg &&
+          MI.getOperand(1).getReg() == Reg) {
+        Value = 0;
+        break;
+      }
+      return false;
+    case X86::MOV32ri:
+      if (MI.getOperand(0).getReg() == Reg) {
+        Value = MI.getOperand(1).getImm();
+        break;
+      }
+      return false;
+    default:
+      return false;
+    }
+    if (Delete)
+      MBB.erase(&MI);
+    return true;
+  }
+  return false;
+}
+
 /// Try to remove the load by folding it to a register
 /// operand at the use. We fold the load instructions if load defines a virtual
 /// register, the virtual register is used once in the same BB, and the
