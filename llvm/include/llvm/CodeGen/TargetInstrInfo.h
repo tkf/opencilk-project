@@ -1412,19 +1412,20 @@ public:
   /// If this block is nothing but a compare and branch if zero or nonzero,
   /// return the register tested and the targets based on the value of the
   /// register.  This is called after register allocation.
-  virtual bool isZeroTest(MachineBasicBlock &MBB, Register &Reg, bool &Dead,
+  virtual bool isZeroTest(MachineBasicBlock &MBB, Register &Reg, bool &Kill,
                           MachineBasicBlock *&Zero,
                           MachineBasicBlock *&Nonzero) const {
     return false;
   }
 
-  /// If this block always set the register to a constant, return true
-  /// and store the contsant in Value.  If Delete is true delete the
-  /// setting instruction.
+  /// If this block always set the register to a constant, return the
+  /// setting instruction and store the constant in Value.  If the
+  /// results of the instruction are used in the basic block set Live
+  /// to true; otherwise the caller may delete the instruction.
   /// This is called after register allocation.
-  virtual bool setsRegister(MachineBasicBlock &MBB, Register Reg,
-                            bool Delete, int64_t &Value) const {
-    return false;
+  virtual MachineInstr *findSetConstant(MachineBasicBlock &MBB, Register Reg,
+                                        bool &Live, int64_t &Value) const {
+    return nullptr;
   }
 
   /// Try to remove the load by folding it to a register operand at the use.

@@ -3825,7 +3825,7 @@ bool X86InstrInfo::optimizeCompareInstr(MachineInstr &CmpInstr, unsigned SrcReg,
 }
 
 bool X86InstrInfo::isZeroTest(MachineBasicBlock &MBB, Register &Reg,
-                              bool &Dead, MachineBasicBlock *&Zero,
+                              bool &Kill, MachineBasicBlock *&Zero,
                               MachineBasicBlock *&Nonzero) const {
   SmallVector<MachineOperand, 2> Cond;
   bool SawUnconditional = false, SawConditional = false;
@@ -3871,7 +3871,7 @@ bool X86InstrInfo::isZeroTest(MachineBasicBlock &MBB, Register &Reg,
       /* TODO: Check for subregs? */
       const MachineOperand &op = MI.getOperand(0);
       if (op.getReg() == MI.getOperand(1).getReg()) {
-        Dead = op.isKill();
+        Kill = op.isKill();
         Reg = op.getReg();
         return true;
       }
@@ -3881,47 +3881,44 @@ bool X86InstrInfo::isZeroTest(MachineBasicBlock &MBB, Register &Reg,
   return false;
 }
 
-bool X86InstrInfo::setsRegister(MachineBasicBlock &MBB, Register Reg,
-                                bool Delete, int64_t &Value) const {
+MachineInstr *X86InstrInfo::findSetConstant(MachineBasicBlock &MBB,
+                                            Register Reg, bool &Live,
+                                            int64_t &Value) const {
+  Live = false;
   const X86RegisterInfo *TRI = &getRegisterInfo();
   for (MachineInstr &MI : llvm::reverse(MBB)) {
     if (!MI.modifiesRegister(Reg, TRI)) {
+      if (MI.readsRegister(Reg, TRI)) {
+        Live = true;
+      }
       continue;
     }
+    if (MI.modifiesRegister(X86::EFLAGS, TRI) &&
+	!MI.registerDefIsDead(X86::EFLAGS, TRI))
+      Live = true;
+    // All the interesting instructions have destination as operand 0.
+    if (MI.getOperand(0).getReg() != Reg)
+      return nullptr;
     switch (MI.getOpcode()) {
     case X86::MOV32r0:
-      if (MI.getOperand(0).getReg() == Reg) {
-        Value = 0;
-        break;
-      }
-      return false;
+      Value = 0;
+      return &MI;
     case X86::MOV32r1:
-      if (MI.getOperand(0).getReg() == Reg) {
-        Value = 1;
-        break;
-      }
-      return false;
+      Value = 1;
+      return &MI;
     case X86::XOR32rr:
-      if (MI.getOperand(0).getReg() == Reg &&
-          MI.getOperand(1).getReg() == Reg) {
-        Value = 0;
-        break;
-      }
-      return false;
+      if (MI.getOperand(1).getReg() != Reg)
+        return nullptr;
+      Value = 0;
+      return &MI;
     case X86::MOV32ri:
-      if (MI.getOperand(0).getReg() == Reg) {
-        Value = MI.getOperand(1).getImm();
-        break;
-      }
-      return false;
+      Value = MI.getOperand(1).getImm();
+      return &MI;
     default:
-      return false;
+      return nullptr;
     }
-    if (Delete)
-      MBB.erase(&MI);
-    return true;
   }
-  return false;
+  return nullptr;
 }
 
 /// Try to remove the load by folding it to a register
