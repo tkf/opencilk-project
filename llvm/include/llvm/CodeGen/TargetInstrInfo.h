@@ -82,6 +82,17 @@ struct RegImmPair {
   RegImmPair(Register Reg, int64_t Imm) : Reg(Reg), Imm(Imm) {}
 };
 
+struct BlockDesc {
+  bool IsSimple = false;
+  // If true, the branch at the end of this block is determined
+  // by whether an input to the block is zero.
+  bool IsBRNZ = false;
+  bool IsKill = false; // If true, the register is not otherwise used.
+  SmallVector<Register, 4> Regs; // More than one if PHI is present
+  MachineBasicBlock *Zero = nullptr; // Target if register is zero
+  MachineBasicBlock *Nonzero = nullptr; // Target if register is not zero
+};
+
 //---------------------------------------------------------------------------
 ///
 /// TargetInstrInfo - Interface to description of machine instruction set
@@ -651,6 +662,13 @@ public:
   virtual unsigned removeBranch(MachineBasicBlock &MBB,
                                 int *BytesRemoved = nullptr) const {
     llvm_unreachable("Target didn't implement TargetInstrInfo::removeBranch!");
+  }
+
+  /// Remove the branches at the end of the block and any compare
+  /// instructions used only by the branches.
+  virtual unsigned removeBranchAndFlags(MachineBasicBlock &MBB,
+                                        int *BytesRemoved = nullptr) const {
+    return removeBranch(MBB, BytesRemoved);
   }
 
   /// Insert branch code into the end of the specified MachineBasicBlock. The
@@ -1409,23 +1427,21 @@ public:
   }
   virtual bool optimizeCondBranch(MachineInstr &MI) const { return false; }
 
-  /// If this block is nothing but a compare and branch if zero or nonzero,
-  /// return the register tested and the targets based on the value of the
-  /// register.  This is called after register allocation.
-  virtual bool isZeroTest(MachineBasicBlock &MBB, Register &Reg, bool &Kill,
-                          MachineBasicBlock *&Zero,
-                          MachineBasicBlock *&Nonzero) const {
+  /// Return true if this block branches depending on whether a register
+  /// is nonzero.  If this method returns true Desc.IsBRNZ is true,
+  /// Desc.Regs holds the registers tested, Zero and Nonzero hold the
+  /// branch targets for zero and nonzero values, and IsKill is true if
+  /// the register is not otherwise used in the block.  More than one
+  /// register will be listed if the tested register is set by a PHI.
+  virtual bool isZeroTest(MachineBasicBlock &MBB, BlockDesc &Desc) const {
     return false;
   }
 
-  /// If this block always set the register to a constant, return the
-  /// setting instruction and store the constant in Value.  If the
-  /// results of the instruction are used in the basic block set Live
-  /// to true; otherwise the caller may delete the instruction.
-  /// This is called after register allocation.
-  virtual MachineInstr *findSetConstant(MachineBasicBlock &MBB, Register Reg,
-                                        bool &Live, int64_t &Value) const {
-    return nullptr;
+  /// If this instruction sets a register to a constant integer value,
+  /// return true, the register, and the value.
+  virtual bool isSetConstant(const MachineInstr &MI, Register &Reg,
+                             int64_t &Value) const {
+    return false;
   }
 
   /// Try to remove the load by folding it to a register operand at the use.
