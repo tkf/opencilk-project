@@ -862,14 +862,14 @@ bool TailDuplicator::tailDuplicate(const BlockDesc &Desc,
         }
         for (Register Reg : Desc.Regs) {
           if (MI->modifiesRegister(Reg, TRI)) {
-            MI = PredBB->instr_rend(); // double break
-            break;
+            goto loop_exit; // double break
           }
           if (MI->readsRegister(Reg, TRI)) {
             Live = true;
           }
         }
       }
+    loop_exit:;
     }
 
     if (!RegSet) {
